@@ -361,12 +361,70 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+echo "==> Installing minidsp-watchdog (auto-recovers from minidspd HID stalls)..."
+# minidsp-rs has a bug where the HID receive loop can fail silently — the
+# daemon stays "running" (so Restart=on-failure never triggers) but every
+# /devices/0 call returns 500 DeviceNotReady. The watchdog probes the HTTP
+# API every 60s; after 2 consecutive failures it restarts both minidsp +
+# minidsp-mqtt and resets the counter.
+cat > /usr/local/sbin/minidsp-health-check << 'EOF'
+#!/bin/bash
+set -eu
+URL="http://127.0.0.1:5380/devices/0"
+STATE=/run/minidsp-watchdog.fail-count
+THRESHOLD=2
+fails=0
+[ -r "$STATE" ] && fails=$(cat "$STATE" 2>/dev/null || echo 0)
+if curl -sf -m 5 "$URL" >/dev/null 2>&1; then
+    [ "$fails" -gt 0 ] && logger -t minidsp-watchdog "minidspd recovered after $fails failed checks"
+    echo 0 > "$STATE"
+    exit 0
+fi
+fails=$((fails + 1))
+echo "$fails" > "$STATE"
+if [ "$fails" -ge "$THRESHOLD" ]; then
+    logger -t minidsp-watchdog "minidspd unresponsive after $fails checks; restarting minidsp + minidsp-mqtt"
+    systemctl restart minidsp.service
+    sleep 2
+    systemctl restart minidsp-mqtt.service
+    echo 0 > "$STATE"
+else
+    logger -t minidsp-watchdog "minidspd check #$fails failed (threshold $THRESHOLD)"
+fi
+EOF
+chmod 755 /usr/local/sbin/minidsp-health-check
+
+cat > /etc/systemd/system/minidsp-watchdog.service << 'EOF'
+[Unit]
+Description=MiniDSP daemon health check + auto-restart
+After=minidsp.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/minidsp-health-check
+EOF
+
+cat > /etc/systemd/system/minidsp-watchdog.timer << 'EOF'
+[Unit]
+Description=Run minidsp-watchdog every 60 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
-systemctl enable squeezelite.service minidsp.service minidsp-mqtt.service
+systemctl enable squeezelite.service minidsp.service minidsp-mqtt.service minidsp-watchdog.timer
 systemctl restart minidsp.service     || true
 sleep 1
 systemctl restart minidsp-mqtt.service || true
 systemctl restart squeezelite.service  || true
+systemctl restart minidsp-watchdog.timer || true
 
 echo ""
 echo "==> Setup complete."
@@ -377,6 +435,7 @@ printf "    MQTT:   %s@%s:%s\n" "${MQTT_USER}" "${MQTT_HOST}" "${MQTT_PORT}"
 echo ""
 echo "    Inspect:  systemctl status squeezelite minidsp minidsp-mqtt"
 echo "    Logs:     journalctl -u squeezelite -u minidsp -u minidsp-mqtt -f"
+echo "    Watchdog: journalctl -t minidsp-watchdog          # auto-restart events"
 echo "    MiniDSP:  minidsp                       (CLI; goes through minidspd)"
 echo "    HTTP API: curl http://127.0.0.1:5380/devices/0"
 echo "    Config:   /etc/default/squeezelite, /etc/default/minidsp-mqtt"
