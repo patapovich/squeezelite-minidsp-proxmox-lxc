@@ -54,13 +54,22 @@ FLOOR_DB         = float(os.environ.get("FLOOR_DB", "-50"))
 CURVE_K          = float(os.environ.get("CURVE_K",  "2"))
 
 # Per-product source enumeration. minidsp-rs's HTTP API does not expose the
-# available sources for a given device, only its product_name; the CLI's help
-# lists the *union* of every product's enum. We map known product_name values
-# to their accepted source names. Names must match what minidsp-rs takes
-# (case-insensitive on input; we use canonical TitleCase here).
+# available sources for a given device, only its product_name; the CLI's
+# --help lists the *union* of every product's enum. We map known
+# product_name values to their accepted source names. Names must match what
+# minidsp-rs accepts (case-insensitive on input; canonical TitleCase here).
+#
+# VERIFIED entries were probed empirically by POSTing each candidate source
+# from minidsp-rs's full enum to /devices/0/config and reading back
+# master.source. Unverified entries are best-effort guesses — if HA shows
+# options that don't actually switch on your device, override with the
+# SOURCES env var (e.g. ./squeezelite-ctl.sh set sources=Analog,Toslink,Usb).
 PRODUCT_SOURCES  = {
+    # Verified on hw_id=10 fw=1.85 (2026-05):
+    "DDRC-24":  ["Analog", "Toslink", "Usb"],
+
+    # Unverified — submit a PR (or update the SOURCES override) if wrong:
     "2x4HD":    ["Analog", "Toslink", "Usb"],
-    "DDRC-24":  ["Analog", "Toslink", "Usb", "Aesebu"],
     "DDRC-88A": ["Analog", "Toslink", "Aesebu"],
     "SHD":      ["Analog", "Toslink", "Spdif", "Usb"],
     "Flex":     ["Analog", "Toslink", "Spdif", "Usb"],
