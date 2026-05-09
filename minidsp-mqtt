@@ -215,11 +215,49 @@ def discovery_payloads(devinfo, sources):
     })
 
 
+# ── command coalescer ───────────────────────────────────────────────────
+# When HA / MQTT publishes a flurry of commands (e.g. dragging the Volume
+# slider 0->100), the bridge previously fired one HTTP POST per command.
+# minidspd serialises HID writes through one connection, so 100 rapid
+# commands queued ~100 device round-trips, blocking subsequent commands
+# and leaving HA's slider lagging. The coalescer collapses bursts: the
+# latest target replaces any pending one and a single dispatch fires after
+# COALESCE_DELAY of quiet.
+COALESCE_DELAY = float(os.environ.get("COALESCE_DELAY", "0.10"))
+
+
+class Coalescer:
+    def __init__(self, loop, delay):
+        self.loop = loop
+        self.delay = delay
+        self.target = None        # latest payload seen
+        self.task = None          # pending dispatch task
+
+    def submit(self, target, dispatch):
+        """Replace the pending target. dispatch is an async callable invoked
+        with the (final) target after `delay` seconds of quiet."""
+        self.target = target
+        if self.task and not self.task.done():
+            self.task.cancel()
+        self.task = self.loop.create_task(self._run(dispatch))
+
+    async def _run(self, dispatch):
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            return
+        try:
+            await dispatch(self.target)
+        except Exception as e:
+            log.error("coalesced dispatch failed: %s", e)
+
+
 # ── bridge ───────────────────────────────────────────────────────────────
 class Bridge:
     def __init__(self, loop):
         self.loop = loop
         self.http = httpx.AsyncClient(base_url=MINIDSPD_URL, timeout=5.0)
+        self._coalescers = {}     # field -> Coalescer
 
         self.mqtt = mqtt.Client(client_id=f"minidsp-mqtt-{NODE_ID}",
                                 clean_session=True)
@@ -228,6 +266,11 @@ class Bridge:
         self.mqtt.will_set(t_status(), "offline", qos=1, retain=True)
         self.mqtt.on_connect = self._on_mqtt_connect
         self.mqtt.on_message = self._on_mqtt_message
+
+    def _coalescer(self, field):
+        if field not in self._coalescers:
+            self._coalescers[field] = Coalescer(self.loop, COALESCE_DELAY)
+        return self._coalescers[field]
 
     # ── HTTP helpers ─────────────────────────────────────────────────────
     async def fetch_devices(self):
@@ -300,8 +343,12 @@ class Bridge:
             return
         field = parts[-2]
         log.debug("mqtt cmd %s = %r", field, payload)
-        asyncio.run_coroutine_threadsafe(
-            self._handle_command(field, payload), self.loop)
+        # Coalesce per-field: a burst of rapid commands collapses to one
+        # dispatch with the latest payload. Runs on the asyncio loop, called
+        # from paho's thread, so use loop.call_soon_threadsafe.
+        coalescer = self._coalescer(field)
+        async def dispatch(p): await self._handle_command(field, p)
+        self.loop.call_soon_threadsafe(coalescer.submit, payload, dispatch)
 
     async def _handle_command(self, field, payload):
         try:
