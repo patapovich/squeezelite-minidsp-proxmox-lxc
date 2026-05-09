@@ -223,7 +223,7 @@ def discovery_payloads(devinfo, sources):
 # and leaving HA's slider lagging. The coalescer collapses bursts: the
 # latest target replaces any pending one and a single dispatch fires after
 # COALESCE_DELAY of quiet.
-COALESCE_DELAY = float(os.environ.get("COALESCE_DELAY", "0.10"))
+COALESCE_DELAY = float(os.environ.get("COALESCE_DELAY", "0.05"))
 
 
 class Coalescer:
