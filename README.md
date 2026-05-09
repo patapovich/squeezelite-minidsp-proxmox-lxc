@@ -74,6 +74,8 @@ Run from the Proxmox host (no need to enter the container):
 ./squeezelite-ctl.sh set device=hw:CARD=DDRC24,DEV=0
 ./squeezelite-ctl.sh set buffer=80:4::1           # squeezelite -a (buffer:periods:format:mmap)
 ./squeezelite-ctl.sh set extra="-d output=info"   # any extra squeezelite flags
+./squeezelite-ctl.sh set floor=-72                # squeezelite-volume FLOOR_DB
+./squeezelite-ctl.sh set curve=2                  # squeezelite-volume CURVE_K (1=linear, >1=bottom-heavy)
 ./squeezelite-ctl.sh set name="Foo" lms=...       # multiple in one call
 ./squeezelite-ctl.sh edit                         # open /etc/default/squeezelite in $EDITOR
 ./squeezelite-ctl.sh restart

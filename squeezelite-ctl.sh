@@ -11,6 +11,8 @@
 #   ./squeezelite-ctl.sh set device=hw:0,0            # change ALSA output
 #   ./squeezelite-ctl.sh set buffer=120:4::1          # change ALSA params (-a)
 #   ./squeezelite-ctl.sh set extra="-d output=info"   # extra squeezelite flags
+#   ./squeezelite-ctl.sh set floor=-30                # volume-script floor
+#   ./squeezelite-ctl.sh set curve=2                  # volume-script curve exponent (1=linear, >1=bottom-heavy)
 #   ./squeezelite-ctl.sh set name="Foo" lms=...       # multiple in one call
 #   ./squeezelite-ctl.sh edit                         # open the file in $EDITOR
 #   ./squeezelite-ctl.sh restart                      # restart the service
@@ -39,7 +41,9 @@ key_to_var() {
         device) echo ALSA_DEVICE ;;
         buffer) echo ALSA_PARAMS ;;
         extra)  echo EXTRA_OPTS ;;
-        *) err "unknown key '$1' (allowed: name, lms, device, buffer, extra)" ;;
+        floor)  echo FLOOR_DB ;;
+        curve)  echo CURVE_K ;;
+        *) err "unknown key '$1' (allowed: name, lms, device, buffer, extra, floor, curve)" ;;
     esac
 }
 

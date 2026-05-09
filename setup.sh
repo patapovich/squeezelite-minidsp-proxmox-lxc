@@ -154,6 +154,11 @@ ALSA_PARAMS="80:4::1"
 
 # Anything else to append (e.g. -d output=info, -c flac,pcm)
 EXTRA_OPTS=""
+
+# squeezelite-volume floor (max attenuation when slider=1). Lower magnitude
+# = less touchy, less dynamic range. Default in the script is -50; common
+# tweaks: -30 (very gentle), -40 (gentle), -60 (more dynamic).
+FLOOR_DB="-50"
 EOF
 
 echo "==> Installing /usr/local/sbin/squeezelite-launch ..."
@@ -164,7 +169,12 @@ echo "==> Installing /usr/local/sbin/squeezelite-launch ..."
 cat > /usr/local/sbin/squeezelite-launch << 'LAUNCH'
 #!/bin/bash
 set -eu
+# `set -a` auto-exports everything sourced from the conf file so the env
+# vars (FLOOR_DB etc.) propagate into the volume-script processes squeezelite
+# forks via system().
+set -a
 . /etc/default/squeezelite
+set +a
 args=(
     -o "${ALSA_DEVICE}"
     -n "${PLAYER_NAME}"
