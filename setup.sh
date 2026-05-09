@@ -312,8 +312,11 @@ BASE_TOPIC="minidsp"
 DISCOVERY_PREFIX="homeassistant"
 NODE_ID="minidsp"
 
-# Source enum exposed in HA (DDRC-24 default; override per device).
-SOURCES="Analog,Toslink,Spdif,Aesebu"
+# Source enum exposed in HA. Empty = auto-discover from minidspd's
+# product_name (DDRC-24 → Analog/Toslink/Usb/Aesebu, SHD → Analog/Toslink/
+# Spdif/Usb, etc.). Set explicitly only to override the lookup for a product
+# we don't know about, or to expose a custom subset.
+SOURCES=""
 
 LOG_LEVEL="INFO"
 EOF

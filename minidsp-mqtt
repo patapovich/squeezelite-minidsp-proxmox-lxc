@@ -23,7 +23,7 @@
 #     NODE_ID            minidsp                (used in MQTT topics + unique_id)
 #     FLOOR_DB           -50                    (sourced from /etc/default/squeezelite)
 #     CURVE_K            2                      (sourced from /etc/default/squeezelite)
-#     SOURCES            Analog,Toslink,Spdif,Aesebu
+#     SOURCES            (empty = auto-discover from product_name)
 #     LOG_LEVEL          INFO
 
 import asyncio
@@ -53,10 +53,46 @@ NODE_ID          = os.environ.get("NODE_ID", "minidsp")
 FLOOR_DB         = float(os.environ.get("FLOOR_DB", "-50"))
 CURVE_K          = float(os.environ.get("CURVE_K",  "2"))
 
-SOURCES          = [s.strip() for s in
-                    os.environ.get("SOURCES", "Analog,Toslink,Spdif,Aesebu").split(",")
+# Per-product source enumeration. minidsp-rs's HTTP API does not expose the
+# available sources for a given device, only its product_name; the CLI's help
+# lists the *union* of every product's enum. We map known product_name values
+# to their accepted source names. Names must match what minidsp-rs takes
+# (case-insensitive on input; we use canonical TitleCase here).
+PRODUCT_SOURCES  = {
+    "2x4HD":    ["Analog", "Toslink", "Usb"],
+    "DDRC-24":  ["Analog", "Toslink", "Usb", "Aesebu"],
+    "DDRC-88A": ["Analog", "Toslink", "Aesebu"],
+    "SHD":      ["Analog", "Toslink", "Spdif", "Usb"],
+    "Flex":     ["Analog", "Toslink", "Spdif", "Usb"],
+    "Studio":   ["Analog", "Usb"],
+}
+
+# Optional explicit override via env. Empty string / unset = auto-discover
+# from product_name. Set this to force a specific list (or to support a
+# product we haven't mapped yet).
+SOURCES_OVERRIDE = [s.strip() for s in
+                    os.environ.get("SOURCES", "").split(",")
                     if s.strip()]
 PRESETS          = ["Config 1", "Config 2", "Config 3", "Config 4"]
+
+
+def discover_sources(devinfo):
+    """Resolve which source names to expose to HA.
+
+    1. SOURCES env var, if set → wins.
+    2. PRODUCT_SOURCES[product_name], if known.
+    3. A safe minimal fallback. Logs a warning so the user knows to override.
+    """
+    if SOURCES_OVERRIDE:
+        return SOURCES_OVERRIDE
+    product = (devinfo.get("product_name") or "").strip()
+    if product in PRODUCT_SOURCES:
+        log.info("auto-discovered sources for %s: %s",
+                 product, PRODUCT_SOURCES[product])
+        return PRODUCT_SOURCES[product]
+    log.warning("unknown product_name %r — falling back to generic sources; "
+                "set SOURCES=... to override", product)
+    return ["Analog", "Toslink", "Usb"]
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -113,7 +149,7 @@ def availability_block():
     }]
 
 
-def discovery_payloads(devinfo):
+def discovery_payloads(devinfo, sources):
     common = {
         "device":       device_block(devinfo),
         "availability": availability_block(),
@@ -146,7 +182,7 @@ def discovery_payloads(devinfo):
         "unique_id":     f"{NODE_ID}_master_source",
         "command_topic": t_set("source"),
         "state_topic":   t_state("source"),
-        "options":       SOURCES,
+        "options":       sources,
         "icon":          "mdi:audio-input-rca",
     })
     yield ("select", "master_preset", {
@@ -219,8 +255,8 @@ class Bridge:
             if 0 <= idx < len(PRESETS):
                 self.publish(t_state("preset"), PRESETS[idx])
 
-    def publish_discovery(self, devinfo):
-        for component, obj, payload in discovery_payloads(devinfo):
+    def publish_discovery(self, devinfo, sources):
+        for component, obj, payload in discovery_payloads(devinfo, sources):
             self.publish(disco_topic(component, obj), json.dumps(payload))
 
     # ── MQTT callbacks (paho thread) ─────────────────────────────────────
@@ -325,11 +361,14 @@ class Bridge:
                 await asyncio.sleep(2)
 
         log.info("device: %s", devinfo)
+        sources = discover_sources(devinfo)
+        log.info("HA source select options: %s", sources)
+
         self.mqtt.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
         self.mqtt.loop_start()
         await asyncio.sleep(1)  # let MQTT settle so retained discovery arrives
 
-        self.publish_discovery(devinfo)
+        self.publish_discovery(devinfo, sources)
 
         master = await self.fetch_master()
         self.publish_master(master)
