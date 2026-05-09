@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+# minidsp-mqtt — bridges minidsp-rs (minidspd HTTP/WS API) to MQTT with
+# Home Assistant autodiscovery.
+#
+# Scope: master volume / mute / source / preset / device info.
+# The volume curve mirrors squeezelite-volume so the LMS slider, IR remote,
+# and HA slider all agree on the same dB value:
+#
+#     gain_dB = FLOOR_DB * (1 - (vol/100)^CURVE_K)        for vol >= 1
+#     vol = 0 -> gain = -127 dB (hard mute)
+#
+# Configuration via environment (see /etc/default/minidsp-mqtt and
+# /etc/default/squeezelite):
+#
+#     MINIDSPD_URL       http://127.0.0.1:5380
+#     DEVICE_INDEX       0
+#     MQTT_HOST          192.168.1.3
+#     MQTT_PORT          1883
+#     MQTT_USER          mqtt
+#     MQTT_PASS          mqtt
+#     BASE_TOPIC         minidsp
+#     DISCOVERY_PREFIX   homeassistant
+#     NODE_ID            minidsp                (used in MQTT topics + unique_id)
+#     FLOOR_DB           -50                    (sourced from /etc/default/squeezelite)
+#     CURVE_K            2                      (sourced from /etc/default/squeezelite)
+#     SOURCES            Analog,Toslink,Spdif,Aesebu
+#     LOG_LEVEL          INFO
+
+import asyncio
+import json
+import logging
+import os
+import signal
+from contextlib import suppress
+
+import httpx
+import paho.mqtt.client as mqtt
+import websockets
+
+
+MINIDSPD_URL     = os.environ.get("MINIDSPD_URL", "http://127.0.0.1:5380").rstrip("/")
+DEVICE_INDEX     = int(os.environ.get("DEVICE_INDEX", "0"))
+
+MQTT_HOST        = os.environ.get("MQTT_HOST", "192.168.1.3")
+MQTT_PORT        = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_USER        = os.environ.get("MQTT_USER", "mqtt")
+MQTT_PASS        = os.environ.get("MQTT_PASS", "mqtt")
+
+BASE_TOPIC       = os.environ.get("BASE_TOPIC", "minidsp")
+DISCOVERY_PREFIX = os.environ.get("DISCOVERY_PREFIX", "homeassistant")
+NODE_ID          = os.environ.get("NODE_ID", "minidsp")
+
+FLOOR_DB         = float(os.environ.get("FLOOR_DB", "-50"))
+CURVE_K          = float(os.environ.get("CURVE_K",  "2"))
+
+SOURCES          = [s.strip() for s in
+                    os.environ.get("SOURCES", "Analog,Toslink,Spdif,Aesebu").split(",")
+                    if s.strip()]
+PRESETS          = ["Config 1", "Config 2", "Config 3", "Config 4"]
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("minidsp-mqtt")
+
+
+# ── volume curve (must stay in sync with squeezelite-volume) ────────────
+def vol_to_db(vol: int) -> float:
+    if vol <= 0:
+        return -127.0
+    v = max(1, min(100, int(vol)))
+    return FLOOR_DB * (1.0 - (v / 100.0) ** CURVE_K)
+
+
+def db_to_vol(db: float) -> int:
+    # Anything well below floor counts as hard mute.
+    if db <= -100.0:
+        return 0
+    g = max(FLOOR_DB, min(0.0, db))
+    if FLOOR_DB == 0:
+        return 100
+    ratio = max(0.0, min(1.0, 1.0 - g / FLOOR_DB))
+    vol = round(100.0 * (ratio ** (1.0 / CURVE_K)))
+    return max(1, min(100, vol))
+
+
+# ── topic helpers ────────────────────────────────────────────────────────
+def t_state(field):  return f"{BASE_TOPIC}/{NODE_ID}/master/{field}"
+def t_set(field):    return f"{BASE_TOPIC}/{NODE_ID}/master/{field}/set"
+def t_status():      return f"{BASE_TOPIC}/{NODE_ID}/status"
+def disco_topic(component, obj):
+    return f"{DISCOVERY_PREFIX}/{component}/{NODE_ID}/{obj}/config"
+
+
+# ── HA discovery payloads ────────────────────────────────────────────────
+def device_block(devinfo):
+    product = devinfo.get("product_name") or devinfo.get("product") or "MiniDSP"
+    return {
+        "identifiers":  [f"minidsp_{NODE_ID}"],
+        "manufacturer": "MiniDSP",
+        "model":        product,
+        "name":         f"MiniDSP ({NODE_ID})",
+        "sw_version":   str(devinfo.get("version", "")) or "minidsp-rs",
+    }
+
+
+def availability_block():
+    return [{
+        "topic":                 t_status(),
+        "payload_available":     "online",
+        "payload_not_available": "offline",
+    }]
+
+
+def discovery_payloads(devinfo):
+    common = {
+        "device":       device_block(devinfo),
+        "availability": availability_block(),
+        "qos":          1,
+    }
+    yield ("number", "master_volume", {
+        **common,
+        "name":                "Volume",
+        "unique_id":           f"{NODE_ID}_master_volume",
+        "command_topic":       t_set("volume"),
+        "state_topic":         t_state("volume"),
+        "min": 0, "max": 100, "step": 1,
+        "mode":                "slider",
+        "unit_of_measurement": "%",
+        "icon":                "mdi:volume-high",
+    })
+    yield ("switch", "master_mute", {
+        **common,
+        "name":          "Mute",
+        "unique_id":     f"{NODE_ID}_master_mute",
+        "command_topic": t_set("mute"),
+        "state_topic":   t_state("mute"),
+        "payload_on":    "ON",
+        "payload_off":   "OFF",
+        "icon":          "mdi:volume-off",
+    })
+    yield ("select", "master_source", {
+        **common,
+        "name":          "Source",
+        "unique_id":     f"{NODE_ID}_master_source",
+        "command_topic": t_set("source"),
+        "state_topic":   t_state("source"),
+        "options":       SOURCES,
+        "icon":          "mdi:audio-input-rca",
+    })
+    yield ("select", "master_preset", {
+        **common,
+        "name":          "Preset",
+        "unique_id":     f"{NODE_ID}_master_preset",
+        "command_topic": t_set("preset"),
+        "state_topic":   t_state("preset"),
+        "options":       PRESETS,
+        "icon":          "mdi:tune-variant",
+    })
+
+
+# ── bridge ───────────────────────────────────────────────────────────────
+class Bridge:
+    def __init__(self, loop):
+        self.loop = loop
+        self.http = httpx.AsyncClient(base_url=MINIDSPD_URL, timeout=5.0)
+
+        self.mqtt = mqtt.Client(client_id=f"minidsp-mqtt-{NODE_ID}",
+                                clean_session=True)
+        if MQTT_USER:
+            self.mqtt.username_pw_set(MQTT_USER, MQTT_PASS)
+        self.mqtt.will_set(t_status(), "offline", qos=1, retain=True)
+        self.mqtt.on_connect = self._on_mqtt_connect
+        self.mqtt.on_message = self._on_mqtt_message
+
+    # ── HTTP helpers ─────────────────────────────────────────────────────
+    async def fetch_devices(self):
+        r = await self.http.get("/devices")
+        r.raise_for_status()
+        devs = r.json()
+        if not devs:
+            raise RuntimeError("minidspd reports no devices")
+        if DEVICE_INDEX >= len(devs):
+            raise RuntimeError(
+                f"DEVICE_INDEX={DEVICE_INDEX} but only {len(devs)} device(s)")
+        return devs[DEVICE_INDEX]
+
+    async def fetch_master(self):
+        r = await self.http.get(f"/devices/{DEVICE_INDEX}")
+        r.raise_for_status()
+        return (r.json() or {}).get("master") or {}
+
+    async def post_config(self, patch):
+        r = await self.http.post(f"/devices/{DEVICE_INDEX}/config", json=patch)
+        if r.status_code >= 400:
+            log.error("POST /devices/%s/config %s -> %s %s",
+                      DEVICE_INDEX, patch, r.status_code, r.text)
+            r.raise_for_status()
+
+    # ── MQTT publish helpers ─────────────────────────────────────────────
+    def publish(self, topic, payload, retain=True, qos=1):
+        self.mqtt.publish(topic, payload, qos=qos, retain=retain)
+
+    def publish_master(self, master: dict):
+        if not master:
+            return
+        if "volume" in master and master["volume"] is not None:
+            self.publish(t_state("volume"), str(db_to_vol(float(master["volume"]))))
+        if "mute" in master and master["mute"] is not None:
+            self.publish(t_state("mute"), "ON" if master["mute"] else "OFF")
+        if "source" in master and master["source"] is not None:
+            self.publish(t_state("source"), str(master["source"]))
+        if "preset" in master and master["preset"] is not None:
+            try:
+                idx = int(master["preset"])
+            except (TypeError, ValueError):
+                idx = -1
+            if 0 <= idx < len(PRESETS):
+                self.publish(t_state("preset"), PRESETS[idx])
+
+    def publish_discovery(self, devinfo):
+        for component, obj, payload in discovery_payloads(devinfo):
+            self.publish(disco_topic(component, obj), json.dumps(payload))
+
+    # ── MQTT callbacks (paho thread) ─────────────────────────────────────
+    def _on_mqtt_connect(self, client, userdata, flags, rc):
+        if rc != 0:
+            log.error("MQTT connect failed rc=%s", rc)
+            return
+        log.info("MQTT connected to %s:%s", MQTT_HOST, MQTT_PORT)
+        self.mqtt.publish(t_status(), "online", qos=1, retain=True)
+        for f in ("volume", "mute", "source", "preset"):
+            self.mqtt.subscribe(t_set(f), qos=1)
+
+    def _on_mqtt_message(self, client, userdata, msg):
+        try:
+            payload = msg.payload.decode("utf-8", "replace").strip()
+        except Exception:
+            log.exception("decode error on %s", msg.topic)
+            return
+        # topic shape: BASE_TOPIC/NODE_ID/master/<field>/set
+        parts = msg.topic.split("/")
+        if len(parts) < 2 or parts[-1] != "set":
+            return
+        field = parts[-2]
+        log.debug("mqtt cmd %s = %r", field, payload)
+        asyncio.run_coroutine_threadsafe(
+            self._handle_command(field, payload), self.loop)
+
+    async def _handle_command(self, field, payload):
+        try:
+            patch = self._build_patch(field, payload)
+            if patch is None:
+                log.warning("ignoring unrecognised command %s=%r", field, payload)
+                return
+            await self.post_config(patch)
+        except Exception as e:
+            log.error("command %s=%r failed: %s", field, payload, e)
+
+    def _build_patch(self, field, payload):
+        if field == "volume":
+            try:
+                vol = int(round(float(payload)))
+            except ValueError:
+                return None
+            vol = max(0, min(100, vol))
+            return {"master_status": {"volume": round(vol_to_db(vol), 2)}}
+        if field == "mute":
+            on = payload.upper() in ("ON", "1", "TRUE", "YES")
+            return {"master_status": {"mute": on}}
+        if field == "source":
+            return {"master_status": {"source": payload}}
+        if field == "preset":
+            p = None
+            try:
+                n = int(payload)
+                if 1 <= n <= 4:
+                    p = n - 1
+                elif 0 <= n <= 3:
+                    p = n
+            except ValueError:
+                if payload in PRESETS:
+                    p = PRESETS.index(payload)
+            if p is None:
+                return None
+            return {"master_status": {"preset": p}}
+        return None
+
+    # ── WS state stream ──────────────────────────────────────────────────
+    async def ws_loop(self):
+        scheme = "wss" if MINIDSPD_URL.startswith("https") else "ws"
+        host = MINIDSPD_URL.split("://", 1)[1]
+        url = f"{scheme}://{host}/devices/{DEVICE_INDEX}?poll=true"
+        backoff = 1
+        while True:
+            try:
+                log.info("WS connecting %s", url)
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    backoff = 1
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            continue
+                        master = data.get("master") if isinstance(data, dict) else None
+                        if master:
+                            self.publish_master(master)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("WS dropped (%s); reconnect in %ss", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(60, backoff * 2)
+
+    # ── orchestration ────────────────────────────────────────────────────
+    async def run(self):
+        # wait for minidspd to be reachable before announcing anything
+        while True:
+            try:
+                devinfo = await self.fetch_devices()
+                break
+            except Exception as e:
+                log.info("waiting for minidspd: %s", e)
+                await asyncio.sleep(2)
+
+        log.info("device: %s", devinfo)
+        self.mqtt.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
+        self.mqtt.loop_start()
+        await asyncio.sleep(1)  # let MQTT settle so retained discovery arrives
+
+        self.publish_discovery(devinfo)
+
+        master = await self.fetch_master()
+        self.publish_master(master)
+
+        await self.ws_loop()
+
+    async def close(self):
+        with suppress(Exception):
+            self.mqtt.publish(t_status(), "offline", qos=1, retain=True)
+        with suppress(Exception):
+            self.mqtt.loop_stop()
+            self.mqtt.disconnect()
+        with suppress(Exception):
+            await self.http.aclose()
+
+
+def main():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    bridge = Bridge(loop)
+    stop = asyncio.Event()
+
+    def _sig(*_):
+        loop.call_soon_threadsafe(stop.set)
+
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+
+    async def runner():
+        task = asyncio.create_task(bridge.run())
+        wait_stop = asyncio.create_task(stop.wait())
+        done, pending = await asyncio.wait(
+            {task, wait_stop}, return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+            with suppress(asyncio.CancelledError):
+                await p
+        await bridge.close()
+
+    try:
+        loop.run_until_complete(runner())
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()

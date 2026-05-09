@@ -7,12 +7,20 @@
 #   PLAYER_NAME   Player name shown in LMS         (default: squeezelite)
 #   LMS_IP        LMS server IP, empty = discover  (default: empty)
 #   MINIDSP_VER   minidsp-rs release version       (default: 0.1.10)
+#   MQTT_HOST     MQTT broker for HA bridge        (default: 192.168.1.3)
+#   MQTT_PORT     MQTT broker port                 (default: 1883)
+#   MQTT_USER     MQTT username                    (default: mqtt)
+#   MQTT_PASS     MQTT password                    (default: mqtt)
 
 set -eu
 
 PLAYER_NAME="${PLAYER_NAME:-squeezelite}"
 LMS_IP="${LMS_IP:-}"
 MINIDSP_VER="${MINIDSP_VER:-0.1.10}"
+MQTT_HOST="${MQTT_HOST:-192.168.1.3}"
+MQTT_PORT="${MQTT_PORT:-1883}"
+MQTT_USER="${MQTT_USER:-mqtt}"
+MQTT_PASS="${MQTT_PASS:-mqtt}"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -60,7 +68,8 @@ apt-get install -y --no-install-recommends \
     libmpg123-dev \
     libfaad-dev \
     libsoxr-dev \
-    libssl-dev
+    libssl-dev \
+    python3 python3-paho-mqtt python3-websockets python3-httpx
 
 echo "==> Building squeezelite from patapovich/squeezelite (fix-volume-script-w-option)..."
 cd /tmp
@@ -92,6 +101,23 @@ git clone -q --depth 1 https://github.com/patapovich/squeezelite-minidsp.git /tm
 install -Dm 755 /tmp/sq-minidsp/squeezelite-source /usr/local/bin/squeezelite-source
 install -Dm 755 /tmp/sq-minidsp/squeezelite-volume /usr/local/bin/squeezelite-volume
 rm -rf /tmp/sq-minidsp
+
+echo "==> Installing minidsp-mqtt bridge..."
+# Pull this repo's own minidsp-mqtt script. proxmox-create-lxc.sh copies it
+# into the container before running setup.sh; if it's not present (manual
+# install on a bare Debian system), fall back to a git fetch.
+if [ ! -x /usr/local/bin/minidsp-mqtt ]; then
+    rm -rf /tmp/sq-lxc
+    git clone -q --depth 1 \
+        https://github.com/patapovich/squeezelite-minidsp-proxmox-lxc.git /tmp/sq-lxc \
+        || true
+    if [ -r /tmp/sq-lxc/minidsp-mqtt ]; then
+        install -Dm 755 /tmp/sq-lxc/minidsp-mqtt /usr/local/bin/minidsp-mqtt
+    fi
+    rm -rf /tmp/sq-lxc
+fi
+[ -x /usr/local/bin/minidsp-mqtt ] || \
+    { echo "ERROR: /usr/local/bin/minidsp-mqtt missing — push it before running setup.sh"; exit 1; }
 
 echo "==> Creating squeezelite system user..."
 getent group plugdev >/dev/null 2>&1 || groupadd -r plugdev
@@ -155,10 +181,16 @@ ALSA_PARAMS="80:4::1"
 # Anything else to append (e.g. -d output=info, -c flac,pcm)
 EXTRA_OPTS=""
 
-# squeezelite-volume floor (max attenuation when slider=1). Lower magnitude
-# = less touchy, less dynamic range. Default in the script is -50; common
-# tweaks: -30 (very gentle), -40 (gentle), -60 (more dynamic).
+# squeezelite-volume / minidsp-mqtt volume curve.
+#   gain_dB = FLOOR_DB * (1 - (vol/100)^CURVE_K)
+# Both the LMS path (squeezelite-volume) and the HA path (minidsp-mqtt) read
+# these vars so the slider behaves identically everywhere.
+#   FLOOR_DB  Lower magnitude = less dynamic range, hotter minimum.
+#             Defaults: -30 gentle, -50 default, -60 more dynamic, -72 wide.
+#   CURVE_K   1 = linear in dB. >1 = bottom-heavy (slider 1-30 sits near
+#             floor, listening sweet spot moves up). <1 = audio-taper feel.
 FLOOR_DB="-50"
+CURVE_K="2"
 EOF
 
 echo "==> Installing /usr/local/sbin/squeezelite-launch ..."
@@ -209,17 +241,127 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+echo "==> Configuring minidspd (HTTP API + Unix socket)..."
+# minidspd exposes:
+#   - HTTP/WS API on 127.0.0.1:5380 (consumed by minidsp-mqtt for HA control)
+#   - /tmp/minidsp.sock so the local `minidsp` CLI multiplexes onto the same
+#     device session — squeezelite-volume's `minidsp gain ...` calls and the
+#     bridge no longer race for the USB endpoint.
+mkdir -p /etc/minidsp
+cat > /etc/minidsp/config.toml << 'EOF'
+# Managed by setup.sh — manual edits get overwritten on re-run.
+
+# HTTP/WS API on a local port + Unix socket.
+# The Unix socket lets the local `minidsp` CLI multiplex through the same
+# device session as the daemon, avoiding USB contention with squeezelite-volume.
+[http_server]
+bind_address = "127.0.0.1:5380"
+bind_unix_path = "/tmp/minidsp.sock"
+
+# TCP server on the legacy port used by the official MiniDSP plugin/mobile
+# apps. Kept so the "official" tooling still works alongside the bridge.
+[[tcp_server]]
+bind_address = "127.0.0.1:5333"
+EOF
+
+echo "==> Installing minidsp.service systemd unit..."
+cat > /etc/systemd/system/minidsp.service << 'EOF'
+[Unit]
+Description=minidsp-rs daemon (HTTP/WS API for HA bridge + multiplexed CLI)
+After=network-online.target
+Wants=network-online.target
+Before=squeezelite.service minidsp-mqtt.service
+
+[Service]
+Type=simple
+# Run as root: in a privileged LXC the host's udev does NOT apply our
+# /etc/udev/rules.d/70-minidsp.rules (host has no 'plugdev' group), so
+# /dev/bus/usb/<bus>/<dev> ends up root:root mode 664. minidspd needs
+# read+write to open the device via libusb. The factory minidsp.service
+# (.deb) runs as root for the same reason.
+ExecStart=/usr/bin/minidspd --config /etc/minidsp/config.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "==> Writing /etc/default/minidsp-mqtt ..."
+# 0640 root:audio — readable by the bridge service (which runs as
+# User=squeezelite Group=audio), not world-readable. The container has no
+# 'squeezelite' group; the squeezelite user's primary group is audio.
+install -m 0640 -g audio /dev/null /etc/default/minidsp-mqtt
+cat > /etc/default/minidsp-mqtt << EOF
+# minidsp-mqtt bridge settings.
+# (Edit then: systemctl restart minidsp-mqtt — or use squeezelite-ctl.sh
+#  on the Proxmox host: ./squeezelite-ctl.sh set mqtt-host=...)
+
+# minidspd HTTP API (local)
+MINIDSPD_URL="http://127.0.0.1:5380"
+DEVICE_INDEX="0"
+
+# MQTT broker — Home Assistant Mosquitto add-on by default
+MQTT_HOST="${MQTT_HOST}"
+MQTT_PORT="${MQTT_PORT}"
+MQTT_USER="${MQTT_USER}"
+MQTT_PASS="${MQTT_PASS}"
+
+# Topic / discovery layout
+BASE_TOPIC="minidsp"
+DISCOVERY_PREFIX="homeassistant"
+NODE_ID="minidsp"
+
+# Source enum exposed in HA (DDRC-24 default; override per device).
+SOURCES="Analog,Toslink,Spdif,Aesebu"
+
+LOG_LEVEL="INFO"
+EOF
+chmod 0640 /etc/default/minidsp-mqtt
+chgrp audio /etc/default/minidsp-mqtt
+
+echo "==> Installing minidsp-mqtt.service systemd unit..."
+# Sources both env files: /etc/default/squeezelite owns FLOOR_DB / CURVE_K so
+# the HA slider and LMS path use the same curve; /etc/default/minidsp-mqtt
+# owns MQTT/topic settings.
+cat > /etc/systemd/system/minidsp-mqtt.service << 'EOF'
+[Unit]
+Description=MiniDSP <-> MQTT bridge (Home Assistant autodiscovery)
+After=network-online.target minidsp.service
+Wants=network-online.target
+Requires=minidsp.service
+
+[Service]
+Type=simple
+User=squeezelite
+Group=audio
+EnvironmentFile=/etc/default/squeezelite
+EnvironmentFile=/etc/default/minidsp-mqtt
+ExecStart=/usr/local/bin/minidsp-mqtt
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
-systemctl enable squeezelite.service
-systemctl restart squeezelite.service || true
+systemctl enable squeezelite.service minidsp.service minidsp-mqtt.service
+systemctl restart minidsp.service     || true
+sleep 1
+systemctl restart minidsp-mqtt.service || true
+systemctl restart squeezelite.service  || true
 
 echo ""
 echo "==> Setup complete."
 printf "    Player: %s\n" "${PLAYER_NAME}"
 printf "    Audio:  %s\n" "${ALSA_DEVICE}"
 printf "    LMS:    %s\n" "${LMS_IP:-auto-discover}"
+printf "    MQTT:   %s@%s:%s\n" "${MQTT_USER}" "${MQTT_HOST}" "${MQTT_PORT}"
 echo ""
-echo "    Inspect:  systemctl status squeezelite"
-echo "    Logs:     journalctl -u squeezelite -f"
-echo "    MiniDSP:  minidsp"
-echo "    Config:   /etc/default/squeezelite (or squeezelite-ctl.sh on host)"
+echo "    Inspect:  systemctl status squeezelite minidsp minidsp-mqtt"
+echo "    Logs:     journalctl -u squeezelite -u minidsp -u minidsp-mqtt -f"
+echo "    MiniDSP:  minidsp                       (CLI; goes through minidspd)"
+echo "    HTTP API: curl http://127.0.0.1:5380/devices/0"
+echo "    Config:   /etc/default/squeezelite, /etc/default/minidsp-mqtt"
+echo "              (or squeezelite-ctl.sh on the Proxmox host)"

@@ -32,6 +32,10 @@
 #   PASSWORD     root password                      (default: squeezelite)
 #   PLAYER_NAME  name shown in LMS                  (default: squeezelite)
 #   LMS_IP       LMS server IP, empty = discover    (default: empty)
+#   MQTT_HOST    MQTT broker (HA Mosquitto add-on)  (default: 192.168.1.3)
+#   MQTT_PORT    MQTT broker port                   (default: 1883)
+#   MQTT_USER    MQTT username                      (default: mqtt)
+#   MQTT_PASS    MQTT password                      (default: mqtt)
 
 set -euo pipefail
 
@@ -56,10 +60,16 @@ TEMPLATE="debian-${DEBIAN_VERSION}-standard"
 
 PLAYER_NAME="${PLAYER_NAME:-squeezelite}"
 LMS_IP="${LMS_IP:-}"
+MQTT_HOST="${MQTT_HOST:-192.168.1.3}"
+MQTT_PORT="${MQTT_PORT:-1883}"
+MQTT_USER="${MQTT_USER:-mqtt}"
+MQTT_PASS="${MQTT_PASS:-mqtt}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SETUP_SCRIPT="${SCRIPT_DIR}/setup.sh"
-[ -r "$SETUP_SCRIPT" ] || { echo "ERROR: $SETUP_SCRIPT not found"; exit 1; }
+BRIDGE_SCRIPT="${SCRIPT_DIR}/minidsp-mqtt"
+[ -r "$SETUP_SCRIPT" ]  || { echo "ERROR: $SETUP_SCRIPT not found"; exit 1; }
+[ -r "$BRIDGE_SCRIPT" ] || { echo "ERROR: $BRIDGE_SCRIPT not found"; exit 1; }
 command -v pct >/dev/null 2>&1 || { echo "ERROR: pct not found — run on a Proxmox host"; exit 1; }
 
 # ── Verify MiniDSP visible on host ────────────────────────────────────────────
@@ -150,14 +160,19 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-echo "==> Pushing setup.sh into container..."
-pct push "$CTID" "$SETUP_SCRIPT" /usr/local/sbin/squeezelite-setup.sh
-pct exec "$CTID" -- chmod 755 /usr/local/sbin/squeezelite-setup.sh
+echo "==> Pushing setup.sh + minidsp-mqtt into container..."
+pct push "$CTID" "$SETUP_SCRIPT"  /usr/local/sbin/squeezelite-setup.sh
+pct push "$CTID" "$BRIDGE_SCRIPT" /usr/local/bin/minidsp-mqtt
+pct exec "$CTID" -- chmod 755 /usr/local/sbin/squeezelite-setup.sh /usr/local/bin/minidsp-mqtt
 
 echo "==> Running setup.sh inside container (this builds squeezelite — ~3 min)..."
 pct exec "$CTID" -- env \
     PLAYER_NAME="$PLAYER_NAME" \
     LMS_IP="$LMS_IP" \
+    MQTT_HOST="$MQTT_HOST" \
+    MQTT_PORT="$MQTT_PORT" \
+    MQTT_USER="$MQTT_USER" \
+    MQTT_PASS="$MQTT_PASS" \
     /usr/local/sbin/squeezelite-setup.sh
 
 # ── Summary ──────────────────────────────────────────────────────────────────
@@ -171,9 +186,11 @@ cat <<INFO
     Login:        pct enter ${CTID}     (or ssh root@${CT_IP:-<ip>})
     Player:       ${PLAYER_NAME}
     LMS:          ${LMS_IP:-auto-discover}
+    MQTT:         ${MQTT_USER}@${MQTT_HOST}:${MQTT_PORT}
 
     Verify:
-      pct exec ${CTID} -- systemctl status squeezelite
+      pct exec ${CTID} -- systemctl status squeezelite minidsp minidsp-mqtt
       pct exec ${CTID} -- minidsp
+      pct exec ${CTID} -- curl -s http://127.0.0.1:5380/devices/0
       pct exec ${CTID} -- aplay -l
 INFO
