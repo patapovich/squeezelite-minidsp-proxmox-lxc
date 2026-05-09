@@ -16,6 +16,7 @@
 #   ./squeezelite-ctl.sh set mqtt-host=192.168.1.3    # MQTT broker for HA bridge
 #   ./squeezelite-ctl.sh set mqtt-user=mqtt mqtt-pass=mqtt
 #   ./squeezelite-ctl.sh set sources=Analog,Toslink,Spdif,Aesebu  # HA select options
+#   ./squeezelite-ctl.sh set ha-floor=54              # HA slider linear-in-dB floor (bridge only)
 #   ./squeezelite-ctl.sh set name="Foo" lms=...       # multiple in one call
 #   ./squeezelite-ctl.sh edit                         # open /etc/default/squeezelite
 #   ./squeezelite-ctl.sh edit-mqtt                    # open /etc/default/minidsp-mqtt
@@ -56,7 +57,8 @@ key_meta() {
         mqtt-pass) echo "MQTT_PASS	$CONF_MQ	minidsp-mqtt" ;;
         sources)   echo "SOURCES	$CONF_MQ	minidsp-mqtt" ;;
         node-id)   echo "NODE_ID	$CONF_MQ	minidsp-mqtt" ;;
-        *) err "unknown key '$1' (allowed: name, lms, device, buffer, extra, floor, curve, mqtt-host, mqtt-port, mqtt-user, mqtt-pass, sources, node-id)" ;;
+        ha-floor)  echo "LMS_VOL_FLOOR	$CONF_MQ	minidsp-mqtt" ;;
+        *) err "unknown key '$1' (allowed: name, lms, device, buffer, extra, floor, curve, mqtt-host, mqtt-port, mqtt-user, mqtt-pass, sources, node-id, ha-floor)" ;;
     esac
 }
 

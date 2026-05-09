@@ -50,8 +50,16 @@ BASE_TOPIC       = os.environ.get("BASE_TOPIC", "minidsp")
 DISCOVERY_PREFIX = os.environ.get("DISCOVERY_PREFIX", "homeassistant")
 NODE_ID          = os.environ.get("NODE_ID", "minidsp")
 
-FLOOR_DB         = float(os.environ.get("FLOOR_DB", "-50"))
-CURVE_K          = float(os.environ.get("CURVE_K",  "2"))
+# Bridge volume mapping is INDEPENDENT of squeezelite-volume's FLOOR_DB / CURVE_K.
+# squeezelite-volume runs in the LMS path: LMS → squeezelite → squeezelite-volume → device.
+# The bridge sees the *resulting* device gain via minidspd's WS feed and tries
+# to display the LMS UI slider position. Empirically, LMS+squeezelite+
+# squeezelite-volume together approximate a linear-in-dB mapping across
+# [-LMS_VOL_FLOOR, 0] dB → [0, 100] slider on this hardware:
+#     gain_dB = -LMS_VOL_FLOOR * (1 - slider/100)
+# Default LMS_VOL_FLOOR=54 was fitted from observed (LMS slider, device gain)
+# pairs (10 → -48, 39 → -33). Override per install if HA drifts from LMS UI.
+LMS_VOL_FLOOR    = float(os.environ.get("LMS_VOL_FLOOR", "54"))
 
 # Per-product source enumeration. minidsp-rs's HTTP API does not expose the
 # available sources for a given device, only its product_name; the CLI's
@@ -110,24 +118,26 @@ logging.basicConfig(
 log = logging.getLogger("minidsp-mqtt")
 
 
-# ── volume curve (must stay in sync with squeezelite-volume) ────────────
+# ── volume curve: linear in dB across [-LMS_VOL_FLOOR, 0] ───────────────
+# This deliberately does NOT use squeezelite-volume's FLOOR_DB / CURVE_K
+# curve. squeezelite-volume's curve is in the LMS path; the bridge instead
+# approximates the *composite* (LMS slider → amp → squeezelite → curve →
+# device dB) so the HA slider tracks what the LMS UI shows.
 def vol_to_db(vol: int) -> float:
     if vol <= 0:
         return -127.0
     v = max(1, min(100, int(vol)))
-    return FLOOR_DB * (1.0 - (v / 100.0) ** CURVE_K)
+    return -LMS_VOL_FLOOR * (1.0 - v / 100.0)
 
 
 def db_to_vol(db: float) -> int:
-    # Anything well below floor counts as hard mute.
-    if db <= -100.0:
+    # Anything well below the bridge's floor counts as hard mute.
+    if db <= -127.0 + 1.0:
         return 0
-    g = max(FLOOR_DB, min(0.0, db))
-    if FLOOR_DB == 0:
+    if LMS_VOL_FLOOR <= 0:
         return 100
-    ratio = max(0.0, min(1.0, 1.0 - g / FLOOR_DB))
-    vol = round(100.0 * (ratio ** (1.0 / CURVE_K)))
-    return max(1, min(100, vol))
+    vol = round(100.0 * (1.0 + db / LMS_VOL_FLOOR))
+    return max(0, min(100, vol))
 
 
 # ── topic helpers ────────────────────────────────────────────────────────
@@ -341,7 +351,10 @@ class Bridge:
         while True:
             try:
                 log.info("WS connecting %s", url)
-                async with websockets.connect(url, ping_interval=20) as ws:
+                # ping_interval=None: minidspd doesn't reply to client pings,
+                # so an active client ping kills the connection every ~60s.
+                # The minidspd-side push of state events keeps the conn alive.
+                async with websockets.connect(url, ping_interval=None) as ws:
                     backoff = 1
                     async for raw in ws:
                         try:

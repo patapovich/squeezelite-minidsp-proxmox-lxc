@@ -313,10 +313,23 @@ DISCOVERY_PREFIX="homeassistant"
 NODE_ID="minidsp"
 
 # Source enum exposed in HA. Empty = auto-discover from minidspd's
-# product_name (DDRC-24 → Analog/Toslink/Usb/Aesebu, SHD → Analog/Toslink/
-# Spdif/Usb, etc.). Set explicitly only to override the lookup for a product
+# product_name. Set explicitly only to override the lookup for a product
 # we don't know about, or to expose a custom subset.
 SOURCES=""
+
+# HA volume slider mapping. The bridge approximates LMS's effective slider
+# as linear-in-dB across [-LMS_VOL_FLOOR, 0] dB → [0, 100]. This makes the
+# HA Volume slider track what the LMS UI shows (LMS-itself-internally uses
+# a curve we don't query — read squeezelite-volume's curve config in
+# /etc/default/squeezelite if you want to retune the LMS path instead).
+#
+# Default 54 was fitted from observed (LMS slider, device gain) pairs on
+# DDRC-24 + cube-law-LMS. Lower magnitude = HA shows higher numbers for the
+# same device gain (less attenuation range exposed). If HA drifts from
+# LMS UI, refit by setting LMS to a known position, reading the device gain
+# (curl http://127.0.0.1:5380/devices/0), and computing
+#   LMS_VOL_FLOOR = -gain_dB / (1 - slider/100).
+LMS_VOL_FLOOR="54"
 
 LOG_LEVEL="INFO"
 EOF
