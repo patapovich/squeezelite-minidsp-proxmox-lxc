@@ -24,6 +24,7 @@
 #     FLOOR_DB           -50                    (sourced from /etc/default/squeezelite)
 #     CURVE_K            2                      (sourced from /etc/default/squeezelite)
 #     SOURCES            (empty = auto-discover from product_name)
+#     MUTE_SENTINEL_DB   -100                   (gain at/below = drop volume publish)
 #     LOG_LEVEL          INFO
 
 import asyncio
@@ -60,6 +61,15 @@ NODE_ID          = os.environ.get("NODE_ID", "minidsp")
 # Default LMS_VOL_FLOOR=54 was fitted from observed (LMS slider, device gain)
 # pairs (10 → -48, 39 → -33). Override per install if HA drifts from LMS UI.
 LMS_VOL_FLOOR    = float(os.environ.get("LMS_VOL_FLOOR", "54"))
+
+# Defensive: if some other path (older squeezelite-volume, a manual
+# `minidsp gain -127`, a future regression) hard-mutes the device, don't
+# republish the resulting near-floor gain to HA — preserve the prior
+# user-meaningful slider position. The bridge's legitimate gain range is
+# [-LMS_VOL_FLOOR, 0]; anything well below that is treated as a sentinel.
+# squeezelite-volume's slider=0 path is itself a no-op now (no device write),
+# so in normal operation this filter never fires.
+MUTE_SENTINEL_DB = float(os.environ.get("MUTE_SENTINEL_DB", "-100"))
 
 # Per-product source enumeration. minidsp-rs's HTTP API does not expose the
 # available sources for a given device, only its product_name; the CLI's
@@ -304,7 +314,11 @@ class Bridge:
         if not master:
             return
         if "volume" in master and master["volume"] is not None:
-            self.publish(t_state("volume"), str(db_to_vol(float(master["volume"]))))
+            gain = float(master["volume"])
+            if gain > MUTE_SENTINEL_DB:
+                self.publish(t_state("volume"), str(db_to_vol(gain)))
+            else:
+                log.debug("ignoring near-floor gain=%.1f (suspected pause-mute)", gain)
         if "mute" in master and master["mute"] is not None:
             self.publish(t_state("mute"), "ON" if master["mute"] else "OFF")
         if "source" in master and master["source"] is not None:
