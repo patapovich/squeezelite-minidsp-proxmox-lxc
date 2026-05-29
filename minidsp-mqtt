@@ -299,12 +299,42 @@ class Bridge:
         r.raise_for_status()
         return (r.json() or {}).get("master") or {}
 
-    async def post_config(self, patch):
-        r = await self.http.post(f"/devices/{DEVICE_INDEX}/config", json=patch)
-        if r.status_code >= 400:
-            log.error("POST /devices/%s/config %s -> %s %s",
-                      DEVICE_INDEX, patch, r.status_code, r.text)
-            r.raise_for_status()
+    async def post_config(self, patch, attempts=3):
+        """POST a config patch to minidspd with bounded retries.
+
+        minidspd's HID receive loop occasionally stalls for sub-second
+        windows (the minidsp-watchdog handles long stalls; this covers
+        the gap before it notices). Retry transient httpx errors and
+        5xx responses with short backoff; bail immediately on 4xx
+        (the patch is malformed — retrying won't help).
+        """
+        last_exc = None
+        for i in range(attempts):
+            try:
+                r = await self.http.post(
+                    f"/devices/{DEVICE_INDEX}/config", json=patch)
+                if r.status_code < 400:
+                    if i > 0:
+                        log.info("POST recovered on attempt %d/%d",
+                                 i + 1, attempts)
+                    return
+                if 400 <= r.status_code < 500:
+                    log.error("POST /devices/%s/config %s -> %s %s",
+                              DEVICE_INDEX, patch, r.status_code, r.text)
+                    r.raise_for_status()
+                # 5xx — retryable
+                last_exc = httpx.HTTPStatusError(
+                    f"server returned {r.status_code}",
+                    request=r.request, response=r)
+            except httpx.HTTPError as e:
+                last_exc = e
+            if i < attempts - 1:
+                delay = 0.2 * (2 ** i)
+                log.warning("POST attempt %d/%d failed (%s); retry in %.1fs",
+                            i + 1, attempts,
+                            type(last_exc).__name__, delay)
+                await asyncio.sleep(delay)
+        raise last_exc
 
     # ── MQTT publish helpers ─────────────────────────────────────────────
     def publish(self, topic, payload, retain=True, qos=1):
@@ -372,7 +402,8 @@ class Bridge:
                 return
             await self.post_config(patch)
         except Exception as e:
-            log.error("command %s=%r failed: %s", field, payload, e)
+            log.error("command %s=%r failed: %s: %s",
+                      field, payload, type(e).__name__, e or "(no message)")
 
     def _build_patch(self, field, payload):
         if field == "volume":
