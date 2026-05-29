@@ -317,19 +317,31 @@ NODE_ID="minidsp"
 # we don't know about, or to expose a custom subset.
 SOURCES=""
 
-# HA volume slider mapping. The bridge approximates LMS's effective slider
-# as linear-in-dB across [-LMS_VOL_FLOOR, 0] dB → [0, 100]. This makes the
-# HA Volume slider track what the LMS UI shows (LMS-itself-internally uses
-# a curve we don't query — read squeezelite-volume's curve config in
-# /etc/default/squeezelite if you want to retune the LMS path instead).
+# HA ↔ LMS slider parity (101-point calibration table).
+# Maps LMS UI slider position (0-100) to the integer "squeezelite-vol"
+# that squeezelite-volume actually receives when LMS sends an AUDG packet
+# for that slider position. LMS's internal slider→ldB curve isn't a clean
+# formula, so a sampled table is the only way to get HA == LMS UI exactly.
 #
-# Default 54 was fitted from observed (LMS slider, device gain) pairs on
-# DDRC-24 + cube-law-LMS. Lower magnitude = HA shows higher numbers for the
-# same device gain (less attenuation range exposed). If HA drifts from
-# LMS UI, refit by setting LMS to a known position, reading the device gain
-# (curl http://127.0.0.1:5380/devices/0), and computing
-#   LMS_VOL_FLOOR = -gain_dB / (1 - slider/100).
-LMS_VOL_FLOOR="54"
+# Default below was measured on 2026-05 against this CT. Re-measure per
+# install if HA ever drifts from LMS UI:
+#   for V in $(seq 0 100); do
+#     curl -s http://<lms>:9000/jsonrpc.js \
+#       -d "{\"id\":1,\"method\":\"slim.request\",\"params\":[\"<MAC>\",[\"mixer\",\"volume\",\"\$V\"]]}" >/dev/null
+#     sleep 0.6
+#     echo -n "\$V:\$(cat /tmp/sq-volume-req),"
+#   done
+CALIBRATION="0:0,1:0,2:1,3:3,4:6,5:8,6:9,7:12,8:14,9:16,10:18,11:20,12:22,13:24,14:26,15:28,16:30,17:32,18:34,19:36,20:38,21:40,22:42,23:44,24:47,25:49,26:49,27:50,28:51,29:51,30:52,31:53,32:53,33:54,34:55,35:55,36:56,37:57,38:58,39:58,40:58,41:60,42:60,43:61,44:62,45:62,46:63,47:64,48:64,49:65,50:66,51:67,52:67,53:68,54:69,55:69,56:70,57:70,58:71,59:72,60:72,61:73,62:74,63:75,64:75,65:76,66:77,67:77,68:78,69:79,70:80,71:80,72:81,73:81,74:82,75:83,76:83,77:84,78:85,79:86,80:86,81:87,82:88,83:88,84:89,85:90,86:90,87:91,88:92,89:92,90:93,91:94,92:95,93:95,94:96,95:97,96:97,97:98,98:99,99:99,100:100"
+
+# Best-effort LMS push so HA-driven volume changes also update the LMS UI
+# slider (otherwise LMS will eventually re-assert its stale slider position
+# and overwrite HA's write). Leave both empty to skip; HA direct device
+# control still works without LMS reachable. Player MAC is the squeezelite
+# slim ID — find it with: curl -s http://<LMS>:9000/jsonrpc.js -d
+# '{"id":1,"method":"slim.request","params":["",["players","0","20"]]}'
+LMS_HOST=""
+LMS_HTTP_PORT="9000"
+LMS_PLAYER_MAC=""
 
 LOG_LEVEL="INFO"
 EOF

@@ -22,7 +22,8 @@
 #     DISCOVERY_PREFIX   homeassistant
 #     NODE_ID            minidsp                (used in MQTT topics + unique_id)
 #     FLOOR_DB           -50                    (sourced from /etc/default/squeezelite)
-#     CURVE_K            2                      (sourced from /etc/default/squeezelite)
+#     CURVE_K            1                      (sourced from /etc/default/squeezelite)
+#     LMS_VOL_FILE       /tmp/sq-volume-req     (squeezelite-volume's REQFILE)
 #     SOURCES            (empty = auto-discover from product_name)
 #     MUTE_SENTINEL_DB   -100                   (gain at/below = drop volume publish)
 #     LOG_LEVEL          INFO
@@ -52,22 +53,102 @@ BASE_TOPIC       = os.environ.get("BASE_TOPIC", "minidsp")
 DISCOVERY_PREFIX = os.environ.get("DISCOVERY_PREFIX", "homeassistant")
 NODE_ID          = os.environ.get("NODE_ID", "minidsp")
 
-# Bridge volume mapping is INDEPENDENT of squeezelite-volume's FLOOR_DB / CURVE_K.
-# squeezelite-volume runs in the LMS path: LMS → squeezelite → squeezelite-volume → device.
-# The bridge sees the *resulting* device gain via minidspd's WS feed and tries
-# to display the LMS UI slider position. Empirically, LMS+squeezelite+
-# squeezelite-volume together approximate a linear-in-dB mapping across
-# [-LMS_VOL_FLOOR, 0] dB → [0, 100] slider on this hardware:
-#     gain_dB = -LMS_VOL_FLOOR * (1 - slider/100)
-# Default LMS_VOL_FLOOR=54 was fitted from observed (LMS slider, device gain)
-# pairs (10 → -48, 39 → -33). Override per install if HA drifts from LMS UI.
-LMS_VOL_FLOOR    = float(os.environ.get("LMS_VOL_FLOOR", "54"))
+# Forward curve matches squeezelite-volume exactly:
+#     gain_dB = FLOOR_DB * (1 - (vol/100)^CURVE_K)
+# These vars are sourced from /etc/default/squeezelite via the bridge's
+# systemd EnvironmentFile, so a single edit keeps the LMS path and the
+# HA path on the same curve.
+FLOOR_DB         = float(os.environ.get("FLOOR_DB", "-50"))
+CURVE_K          = float(os.environ.get("CURVE_K",  "1"))
+
+# For LMS-driven state, read the integer vol that squeezelite-volume just
+# received from squeezelite (and wrote to this file as its first line of
+# work). That value is **squeezelite-vol** — what squeezelite computed
+# from LMS's AUDG gain — not the LMS UI slider position; LMS's internal
+# slider→AUDG curve differs from squeezelite's AUDG→vol formula, so the
+# two diverge by up to ~20 points across the range. CALIBRATION (below)
+# maps between them so HA can display the LMS UI slider value exactly.
+LMS_VOL_FILE     = os.environ.get("LMS_VOL_FILE", "/tmp/sq-volume-req")
+
+# Per-install calibration: maps LMS UI slider positions to the integer
+# squeezelite VOL that squeezelite-volume actually receives for that
+# LMS slider position. Used in both directions so the HA slider displays
+# the LMS UI slider value exactly.
+#
+# Default was measured on 2026-05 by sweeping LMS volume 0..100 by 10
+# and reading /tmp/sq-volume-req at each step. Override per install via:
+#
+#   ./squeezelite-ctl.sh set calibration="0:0,10:18,...,100:100"
+#
+# Format: comma-separated `<lms>:<sq>` pairs, sorted by lms ascending.
+# To re-measure: stop LMS playback fade-in (or just play music), call
+# `<player> mixer volume <V>` for V in [0,10,…,100], read the file each
+# time, paste the pairs into CALIBRATION.
+CALIBRATION_DEFAULT = ("0:0,10:18,20:38,30:52,40:58,50:66,"
+                       "60:72,70:80,80:86,90:93,100:100")
+CALIBRATION         = os.environ.get("CALIBRATION", CALIBRATION_DEFAULT)
+
+# Best-effort LMS push. After a HA-driven volume change, the bridge can
+# tell LMS to update its own slider state so LMS doesn't later re-assert
+# its (stale) slider position and overwrite HA's write. Skipped if either
+# var is empty. LMS unreachable is non-fatal — direct device control on
+# HA side keeps working.
+LMS_HOST         = os.environ.get("LMS_HOST", "").strip()
+LMS_HTTP_PORT    = int(os.environ.get("LMS_HTTP_PORT", "9000"))
+LMS_PLAYER_MAC   = os.environ.get("LMS_PLAYER_MAC", "").strip()
+LMS_RPC_URL      = (f"http://{LMS_HOST}:{LMS_HTTP_PORT}/jsonrpc.js"
+                    if LMS_HOST and LMS_PLAYER_MAC else None)
+
+
+def _parse_calibration(spec):
+    pairs = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            lms_s, sq_s = chunk.split(":", 1)
+            pairs.append((int(lms_s), int(sq_s)))
+        except (ValueError, AttributeError):
+            log.warning("CALIBRATION: ignoring malformed pair %r", chunk)
+    if not pairs:
+        # Sane fallback: identity. Avoids zero-length table arithmetic.
+        pairs = [(0, 0), (100, 100)]
+    pairs.sort(key=lambda p: p[0])
+    return pairs
+
+
+def _interp(x, pairs, key_idx, val_idx):
+    """Piecewise-linear interpolation across a sorted (sorted by pairs[*][key_idx]) list."""
+    if x <= pairs[0][key_idx]:
+        return pairs[0][val_idx]
+    if x >= pairs[-1][key_idx]:
+        return pairs[-1][val_idx]
+    for i in range(len(pairs) - 1):
+        x0, x1 = pairs[i][key_idx], pairs[i+1][key_idx]
+        if x0 <= x <= x1:
+            y0, y1 = pairs[i][val_idx], pairs[i+1][val_idx]
+            if x1 == x0:
+                return y0
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return pairs[-1][val_idx]
+
+
+def lms_to_sq(lms_vol: int) -> int:
+    """LMS UI slider (0-100) → integer squeezelite-vol via CALIBRATION."""
+    return int(round(_interp(lms_vol, _CALIB_BY_LMS, 0, 1)))
+
+
+def sq_to_lms(sq_vol: int) -> int:
+    """Inverse: squeezelite-vol → LMS UI slider via CALIBRATION."""
+    return int(round(_interp(sq_vol, _CALIB_BY_SQ, 1, 0)))
 
 # Defensive: if some other path (older squeezelite-volume, a manual
 # `minidsp gain -127`, a future regression) hard-mutes the device, don't
 # republish the resulting near-floor gain to HA — preserve the prior
 # user-meaningful slider position. The bridge's legitimate gain range is
-# [-LMS_VOL_FLOOR, 0]; anything well below that is treated as a sentinel.
+# [FLOOR_DB, 0]; anything well below that is treated as a sentinel.
 # squeezelite-volume's slider=0 path is itself a no-op now (no device write),
 # so in normal operation this filter never fires.
 MUTE_SENTINEL_DB = float(os.environ.get("MUTE_SENTINEL_DB", "-100"))
@@ -128,27 +209,49 @@ logging.basicConfig(
 )
 log = logging.getLogger("minidsp-mqtt")
 
+# CALIBRATION tables: sorted by LMS column for forward lookup, by sq column
+# for inverse. Built once at import. _parse_calibration logs warnings via
+# `log`, so this must come after `log` is set up.
+_CALIB_PAIRS  = _parse_calibration(CALIBRATION)
+_CALIB_BY_LMS = sorted(_CALIB_PAIRS, key=lambda p: p[0])
+_CALIB_BY_SQ  = sorted(_CALIB_PAIRS, key=lambda p: p[1])
+log.info("calibration: %s", _CALIB_PAIRS)
 
-# ── volume curve: linear in dB across [-LMS_VOL_FLOOR, 0] ───────────────
-# This deliberately does NOT use squeezelite-volume's FLOOR_DB / CURVE_K
-# curve. squeezelite-volume's curve is in the LMS path; the bridge instead
-# approximates the *composite* (LMS slider → amp → squeezelite → curve →
-# device dB) so the HA slider tracks what the LMS UI shows.
+
+# ── volume curve (matches squeezelite-volume exactly) ───────────────────
+# Same `gain = FLOOR_DB * (1 - (vol/100)^CURVE_K)` formula as the script.
+# State is normally sourced from LMS_VOL_FILE (see read_lms_vol below) so
+# this inverse is only used as a fallback when the file is missing.
 def vol_to_db(vol: int) -> float:
     if vol <= 0:
-        return -127.0
+        # HA slider 0 → device floor (NOT -127 hard mute; that's the
+        # squeezelite-pause sentinel filtered by MUTE_SENTINEL_DB).
+        return FLOOR_DB
     v = max(1, min(100, int(vol)))
-    return -LMS_VOL_FLOOR * (1.0 - v / 100.0)
+    return FLOOR_DB * (1.0 - (v / 100.0) ** CURVE_K)
 
 
 def db_to_vol(db: float) -> int:
-    # Anything well below the bridge's floor counts as hard mute.
     if db <= -127.0 + 1.0:
         return 0
-    if LMS_VOL_FLOOR <= 0:
+    if FLOOR_DB >= 0 or CURVE_K <= 0:
         return 100
-    vol = round(100.0 * (1.0 + db / LMS_VOL_FLOOR))
+    g = max(FLOOR_DB, min(0.0, db))
+    ratio = max(0.0, min(1.0, 1.0 - g / FLOOR_DB))
+    vol = round(100.0 * (ratio ** (1.0 / CURVE_K)))
     return max(0, min(100, vol))
+
+
+def read_lms_vol():
+    """Return the integer VOL squeezelite-volume last received from
+    squeezelite, or None if the file is missing / unreadable / malformed.
+    This is the byte-exact LMS slider position, so we prefer it over the
+    inverse curve for HA state when available."""
+    try:
+        with open(LMS_VOL_FILE, "r") as f:
+            return max(0, min(100, int(f.read().strip())))
+    except (OSError, ValueError):
+        return None
 
 
 # ── topic helpers ────────────────────────────────────────────────────────
@@ -285,6 +388,15 @@ class Bridge:
         # deliver into a void. Updated by _on_mqtt_message.
         self.last_inbound_ms = 0
 
+        # Bridge-initiated write tracker. When HA pushes a volume change
+        # we POST a dB value AND echo the HA-input integer to the state
+        # topic. The WS will subsequently report that same dB back; if it
+        # matches `last_written_gain` (±0.5 dB) and is fresh (≤3 s), we
+        # suppress the volume re-publish so a stale /tmp/sq-volume-req
+        # read can't clobber the echoed value.
+        self.last_written_gain = None
+        self.last_written_ts   = 0.0
+
     def _coalescer(self, field):
         if field not in self._coalescers:
             self._coalescers[field] = Coalescer(self.loop, COALESCE_DELAY)
@@ -306,6 +418,23 @@ class Bridge:
         r = await self.http.get(f"/devices/{DEVICE_INDEX}")
         r.raise_for_status()
         return (r.json() or {}).get("master") or {}
+
+    async def _lms_set_volume(self, vol_str):
+        """Fire-and-forget JSON-RPC push to LMS so its slider stays in
+        sync with HA-driven changes. 2-second timeout; any failure is
+        logged at DEBUG and swallowed."""
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                await client.post(LMS_RPC_URL, json={
+                    "id": 1,
+                    "method": "slim.request",
+                    "params": [LMS_PLAYER_MAC,
+                               ["mixer", "volume", str(vol_str)]],
+                })
+        except Exception as e:
+            log.debug("LMS push %s=%s failed: %s: %s",
+                      LMS_PLAYER_MAC, vol_str,
+                      type(e).__name__, e or "(no message)")
 
     async def post_config(self, patch, attempts=3):
         """POST a config patch to minidspd with bounded retries.
@@ -348,15 +477,44 @@ class Bridge:
     def publish(self, topic, payload, retain=True, qos=1):
         self.mqtt.publish(topic, payload, qos=qos, retain=retain)
 
+    def _publish_volume_state(self, gain: float):
+        """Pick the LMS-UI-equivalent vol for a device gain reading and
+        publish it to the state topic.
+
+        Priority:
+          1. If this WS event is the echo of our own recent HA-driven
+             POST (|gain - last_written_gain| <= 0.5 dB, within 3 s),
+             suppress — HA already saw the echoed value at command time.
+          2. Else read /tmp/sq-volume-req — that's the integer
+             squeezelite-vol squeezelite-volume just received. Run it
+             through the CALIBRATION table to get the matching LMS UI
+             slider value, then publish.
+          3. Else fall back to inverse curve from gain → squeezelite-vol
+             → CALIBRATION → LMS UI value.
+        """
+        now = time.monotonic()
+        if (self.last_written_gain is not None
+            and (now - self.last_written_ts) <= 3.0
+            and abs(gain - self.last_written_gain) <= 0.5):
+            log.debug("WS echo of own write (%.1f dB); state already published",
+                      gain)
+            return
+        sq = read_lms_vol()
+        if sq is None:
+            sq = db_to_vol(gain)
+            log.debug("LMS_VOL_FILE unavailable; using inverse curve -> sq=%d", sq)
+        lms_vol = sq_to_lms(sq)
+        self.publish(t_state("volume"), str(lms_vol))
+
     def publish_master(self, master: dict):
         if not master:
             return
         if "volume" in master and master["volume"] is not None:
             gain = float(master["volume"])
-            if gain > MUTE_SENTINEL_DB:
-                self.publish(t_state("volume"), str(db_to_vol(gain)))
-            else:
+            if gain <= MUTE_SENTINEL_DB:
                 log.debug("ignoring near-floor gain=%.1f (suspected pause-mute)", gain)
+            else:
+                self._publish_volume_state(gain)
         if "mute" in master and master["mute"] is not None:
             self.publish(t_state("mute"), "ON" if master["mute"] else "OFF")
         if "source" in master and master["source"] is not None:
@@ -421,7 +579,22 @@ class Bridge:
             if patch is None:
                 log.warning("ignoring unrecognised command %s=%r", field, payload)
                 return
+            # For HA-driven volume changes: echo the user's exact integer
+            # to the state topic and mark the upcoming WS feedback as "ours"
+            # so it doesn't trigger a stale LMS_VOL_FILE read.
+            if field == "volume":
+                target_db = patch.get("master_status", {}).get("volume")
+                if target_db is not None:
+                    self.last_written_gain = float(target_db)
+                    self.last_written_ts   = time.monotonic()
+                    self.publish(t_state("volume"), payload.strip())
             await self.post_config(patch)
+            # Best-effort: tell LMS to update its own slider too, so it
+            # doesn't later re-assert a stale position and overwrite us.
+            # Errors are intentionally swallowed — HA-only control must
+            # work when LMS is unreachable.
+            if field == "volume" and LMS_RPC_URL:
+                await self._lms_set_volume(payload.strip())
         except Exception as e:
             log.error("command %s=%r failed: %s: %s",
                       field, payload, type(e).__name__, e or "(no message)")
@@ -429,11 +602,17 @@ class Bridge:
     def _build_patch(self, field, payload):
         if field == "volume":
             try:
-                vol = int(round(float(payload)))
+                # HA volume is the LMS UI slider position. Translate to
+                # the squeezelite-vol the script would have produced for
+                # that LMS slider (via CALIBRATION) before applying the
+                # script's curve to compute device dB. Forward + inverse
+                # paths agree by construction.
+                lms_vol = int(round(float(payload)))
             except ValueError:
                 return None
-            vol = max(0, min(100, vol))
-            return {"master_status": {"volume": round(vol_to_db(vol), 2)}}
+            lms_vol = max(0, min(100, lms_vol))
+            sq_target = lms_to_sq(lms_vol)
+            return {"master_status": {"volume": round(vol_to_db(sq_target), 2)}}
         if field == "mute":
             on = payload.upper() in ("ON", "1", "TRUE", "YES")
             return {"master_status": {"mute": on}}

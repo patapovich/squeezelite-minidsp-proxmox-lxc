@@ -118,7 +118,7 @@ HA device appears on first connect with these entities:
 
 | Entity | Type | Notes |
 |---|---|---|
-| Volume | `number` 0–100 | Same curve as `squeezelite-volume`. LMS / IR / HA agree. |
+| Volume | `number` 0–100 | Same curve as `squeezelite-volume`. LMS / IR / HA agree exactly — see "Volume parity" below. |
 | Mute | `switch` | Independent of volume slider. |
 | Source | `select` | Options come from `SOURCES` env. The bridge ships a generic default of `Analog,Toslink,Spdif,Aesebu`; **DDRC-24 has `Usb` instead of `Spdif`** — set `./squeezelite-ctl.sh set sources=Analog,Toslink,Usb,Aesebu` to match. |
 | Preset | `select` | `Config 1`–`Config 4`. |
@@ -128,12 +128,52 @@ Volume curve (matches `squeezelite-volume`):
 
 ```
 gain_dB = FLOOR_DB * (1 - (vol/100)^CURVE_K)        # vol = 1..100
-vol = 0  →  gain = -127 dB (hard mute)
+vol = 0  →  gain = FLOOR_DB (HA-driven floor; not hard mute)
 ```
 
 Defaults `FLOOR_DB=-50`, `CURVE_K=2`. Both the LMS-driven path and the HA
 slider read the same `/etc/default/squeezelite`, so changing `floor` or
 `curve` updates both at once.
+
+### Volume parity (LMS UI ↔ HA slider exact)
+
+LMS's internal slider → AUDG curve doesn't match squeezelite's AUDG → vol
+formula, so the integer squeezelite-vol that `squeezelite-volume` receives
+differs from the LMS UI slider by up to ~20 points across the range. To
+display the LMS UI value exactly, the bridge keeps a 101-point
+`CALIBRATION` table mapping LMS UI slider → squeezelite-vol, used in both
+directions:
+
+- **LMS-driven state** (LMS slider moves → `squeezelite-volume` runs):
+  the script writes its integer to `/tmp/sq-volume-req` (LMS_VOL_FILE).
+  Bridge reads that file on every WS event and inverse-looks-up the
+  table to publish the matching LMS UI value.
+- **HA-driven command**: bridge echoes the user's input verbatim to the
+  state topic, forward-looks-up the table to get the target
+  squeezelite-vol, runs the script's curve to get the device dB, and
+  POSTs. The bridge also fire-and-forgets a JSON-RPC `mixer volume X`
+  to LMS (if `LMS_HOST` and `LMS_PLAYER_MAC` are set) so LMS's UI
+  slider tracks the HA-driven change and doesn't later re-assert its
+  stale position.
+
+Re-measure the table per install if HA drifts from LMS UI:
+
+```sh
+PLAYER=bc:24:11:3e:6a:17        # your squeezelite player MAC
+LMS=192.168.1.136:9000
+for V in $(seq 0 100); do
+  curl -s http://$LMS/jsonrpc.js \
+    -d "{\"id\":1,\"method\":\"slim.request\",\"params\":[\"$PLAYER\",[\"mixer\",\"volume\",\"$V\"]]}" >/dev/null
+  sleep 0.6
+  printf "%d:%s," $V "$(cat /tmp/sq-volume-req)"
+done; echo
+```
+
+Paste the result into `./squeezelite-ctl.sh set calibration="…"`.
+
+Expected residual error: 0 across the table, with rare ±1 points where
+LMS's curve is locally flat (multiple LMS slider positions map to the
+same AUDG → ambiguous inverse).
 
 MQTT topic layout (`minidsp/<NODE_ID>/...`):
 

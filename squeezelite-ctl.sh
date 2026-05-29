@@ -16,8 +16,11 @@
 #   ./squeezelite-ctl.sh set mqtt-host=192.168.1.3    # MQTT broker for HA bridge
 #   ./squeezelite-ctl.sh set mqtt-user=mqtt mqtt-pass=mqtt
 #   ./squeezelite-ctl.sh set sources=Analog,Toslink,Spdif,Aesebu  # HA select options
-#   ./squeezelite-ctl.sh set ha-floor=54              # HA slider linear-in-dB floor (bridge only)
+#   ./squeezelite-ctl.sh set ha-floor=54              # legacy: linear-in-dB approximation (unused since CALIBRATION)
 #   ./squeezelite-ctl.sh set delay=0.03               # bridge command-coalesce window (s; smaller = snappier)
+#   ./squeezelite-ctl.sh set calibration="0:0,...100:100"   # LMS slider ↔ squeezelite-vol mapping
+#   ./squeezelite-ctl.sh set lms-host=192.168.1.136   # LMS JSON-RPC host (for HA→LMS sync; optional)
+#   ./squeezelite-ctl.sh set lms-player=bc:24:11:3e:6a:17   # player MAC for LMS JSON-RPC
 #   ./squeezelite-ctl.sh set name="Foo" lms=...       # multiple in one call
 #   ./squeezelite-ctl.sh edit                         # open /etc/default/squeezelite
 #   ./squeezelite-ctl.sh edit-mqtt                    # open /etc/default/minidsp-mqtt
@@ -60,7 +63,10 @@ key_meta() {
         node-id)   echo "NODE_ID	$CONF_MQ	minidsp-mqtt" ;;
         ha-floor)  echo "LMS_VOL_FLOOR	$CONF_MQ	minidsp-mqtt" ;;
         delay)     echo "COALESCE_DELAY	$CONF_MQ	minidsp-mqtt" ;;
-        *) err "unknown key '$1' (allowed: name, lms, device, buffer, extra, floor, curve, mqtt-host, mqtt-port, mqtt-user, mqtt-pass, sources, node-id, ha-floor, delay)" ;;
+        calibration)   echo "CALIBRATION	$CONF_MQ	minidsp-mqtt" ;;
+        lms-host)      echo "LMS_HOST	$CONF_MQ	minidsp-mqtt" ;;
+        lms-player)    echo "LMS_PLAYER_MAC	$CONF_MQ	minidsp-mqtt" ;;
+        *) err "unknown key '$1' (allowed: name, lms, device, buffer, extra, floor, curve, mqtt-host, mqtt-port, mqtt-user, mqtt-pass, sources, node-id, ha-floor, delay, calibration, lms-host, lms-player)" ;;
     esac
 }
 
