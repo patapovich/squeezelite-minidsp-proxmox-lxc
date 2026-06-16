@@ -378,6 +378,48 @@ class Coalescer:
             log.error("coalesced dispatch failed: %s", e)
 
 
+class Throttle:
+    """Leading + trailing rate limiter. Unlike Coalescer (trailing-only —
+    fires after `interval` of quiet, i.e. on button *release*), Throttle
+    fires immediately on the first submit then at most once per `interval`
+    while submits keep arriving, always ending on the latest value. A held
+    volume ramp therefore tracks live during the hold instead of jumping
+    once at the end, while still capping device writes to one per `interval`
+    (≈ minidspd's HID round-trip) so the flood can't saturate."""
+
+    def __init__(self, loop, interval):
+        self.loop = loop
+        self.interval = interval
+        self.target = None        # latest payload seen
+        self.dispatch = None      # latest dispatch callable
+        self.last_fire = 0.0      # monotonic time of last dispatch
+        self.scheduled = False    # a trailing fire is armed
+
+    def submit(self, target, dispatch):
+        self.target = target
+        self.dispatch = dispatch
+        if self.scheduled:
+            return                # trailing fire already armed; it'll use target
+        elapsed = time.monotonic() - self.last_fire
+        if elapsed >= self.interval:
+            self._fire()
+        else:
+            self.scheduled = True
+            self.loop.call_later(self.interval - elapsed, self._fire)
+
+    def _fire(self):
+        self.scheduled = False
+        self.last_fire = time.monotonic()
+        target, dispatch = self.target, self.dispatch
+        self.loop.create_task(self._run(dispatch, target))
+
+    async def _run(self, dispatch, target):
+        try:
+            await dispatch(target)
+        except Exception as e:
+            log.error("throttled dispatch failed: %s", e)
+
+
 # ── bridge ───────────────────────────────────────────────────────────────
 class Bridge:
     def __init__(self, loop):
@@ -417,6 +459,10 @@ class Bridge:
         # Debounced LMS slider-sync push: collapses a volume ramp to one
         # JSON-RPC call after LMS_PUSH_DELAY of quiet.
         self._lms_push = Coalescer(self.loop, LMS_PUSH_DELAY)
+        # Volume uses a leading+trailing throttle (live tracking during a held
+        # remote ramp) instead of the trailing-only Coalescer used by the
+        # discrete mute/source/preset fields.
+        self._volume_throttle = Throttle(self.loop, COALESCE_DELAY)
 
     def _coalescer(self, field):
         if field not in self._coalescers:
@@ -587,12 +633,14 @@ class Bridge:
             return
         field = parts[-2]
         log.debug("mqtt cmd %s = %r", field, payload)
-        # Coalesce per-field: a burst of rapid commands collapses to one
-        # dispatch with the latest payload. Runs on the asyncio loop, called
-        # from paho's thread, so use loop.call_soon_threadsafe.
-        coalescer = self._coalescer(field)
+        # Rate-limit per field. Volume uses a leading+trailing Throttle so a
+        # held remote ramp tracks live (write on press, capped rate during the
+        # hold, final value on release). The discrete fields use the
+        # trailing-only Coalescer (a burst collapses to one dispatch). Runs on
+        # the asyncio loop, called from paho's thread → call_soon_threadsafe.
+        limiter = self._volume_throttle if field == "volume" else self._coalescer(field)
         async def dispatch(p): await self._handle_command(field, p)
-        self.loop.call_soon_threadsafe(coalescer.submit, payload, dispatch)
+        self.loop.call_soon_threadsafe(limiter.submit, payload, dispatch)
 
     async def _handle_command(self, field, payload):
         try:
