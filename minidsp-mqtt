@@ -337,7 +337,19 @@ def discovery_payloads(devinfo, sources):
 # and leaving HA's slider lagging. The coalescer collapses bursts: the
 # latest target replaces any pending one and a single dispatch fires after
 # COALESCE_DELAY of quiet.
-COALESCE_DELAY = float(os.environ.get("COALESCE_DELAY", "0.05"))
+COALESCE_DELAY = float(os.environ.get("COALESCE_DELAY", "0.12"))
+
+# Bridge-side flood guards (TV-mirror / QoS-0 broker duplication). An LG
+# remote held on volume-up makes HA publish a stream of steps; HA's default
+# mqtt.publish QoS is 0 and a misconfigured broker re-injects each one, so the
+# bridge can see every target twice. Two guards keep minidspd's serialised HID
+# writes from saturating, independent of any HA/broker-side fix:
+#   * an exact-duplicate command (same payload within DEDUP_WINDOW_S) is
+#     dropped — a QoS-0 double becomes a no-op;
+#   * the LMS slider-sync push is debounced (LMS_PUSH_DELAY of quiet) so a
+#     ramp fires one JSON-RPC at the settled value, not one per step.
+DEDUP_WINDOW_S = float(os.environ.get("DEDUP_WINDOW_S", "2.0"))
+LMS_PUSH_DELAY = float(os.environ.get("LMS_PUSH_DELAY", "0.3"))
 
 
 class Coalescer:
@@ -396,6 +408,15 @@ class Bridge:
         # read can't clobber the echoed value.
         self.last_written_gain = None
         self.last_written_ts   = 0.0
+
+        # Exact-duplicate volume guard (QoS-0 broker doubling / repeated
+        # same-value tap). An identical payload within DEDUP_WINDOW_S is
+        # dropped before it reaches the device.
+        self.last_vol_payload    = None
+        self.last_vol_payload_ts = 0.0
+        # Debounced LMS slider-sync push: collapses a volume ramp to one
+        # JSON-RPC call after LMS_PUSH_DELAY of quiet.
+        self._lms_push = Coalescer(self.loop, LMS_PUSH_DELAY)
 
     def _coalescer(self, field):
         if field not in self._coalescers:
@@ -583,18 +604,31 @@ class Bridge:
             # to the state topic and mark the upcoming WS feedback as "ours"
             # so it doesn't trigger a stale LMS_VOL_FILE read.
             if field == "volume":
+                p = payload.strip()
+                now = time.monotonic()
+                # Drop an exact-duplicate command (QoS-0 broker doubling or a
+                # repeated same-value tap) seen within DEDUP_WINDOW_S: the
+                # device is already there, so skip the POST and the LMS push.
+                if (self.last_vol_payload == p
+                        and (now - self.last_vol_payload_ts) <= DEDUP_WINDOW_S):
+                    log.debug("dedup duplicate volume %r within %.2fs; skipping",
+                              p, now - self.last_vol_payload_ts)
+                    return
+                self.last_vol_payload    = p
+                self.last_vol_payload_ts = now
                 target_db = patch.get("master_status", {}).get("volume")
                 if target_db is not None:
                     self.last_written_gain = float(target_db)
-                    self.last_written_ts   = time.monotonic()
-                    self.publish(t_state("volume"), payload.strip())
+                    self.last_written_ts   = now
+                    self.publish(t_state("volume"), p)
             await self.post_config(patch)
-            # Best-effort: tell LMS to update its own slider too, so it
-            # doesn't later re-assert a stale position and overwrite us.
-            # Errors are intentionally swallowed — HA-only control must
-            # work when LMS is unreachable.
+            # Best-effort, debounced: tell LMS to update its own slider so it
+            # doesn't later re-assert a stale position. The push is coalesced
+            # (LMS_PUSH_DELAY of quiet) so a ramp fires one JSON-RPC, not one
+            # per step. Errors are swallowed — HA-only control must work when
+            # LMS is unreachable.
             if field == "volume" and LMS_RPC_URL:
-                await self._lms_set_volume(payload.strip())
+                self._lms_push.submit(payload.strip(), self._lms_set_volume)
         except Exception as e:
             log.error("command %s=%r failed: %s: %s",
                       field, payload, type(e).__name__, e or "(no message)")
