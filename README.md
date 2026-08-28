@@ -48,8 +48,12 @@ char-major 116 + 189), then runs `setup.sh` inside the container to:
   session — no more USB contention between LMS volume writes and HA writes
 - install `minidsp-mqtt`, a small Python bridge that exposes master volume,
   mute, source and preset over MQTT with **Home Assistant autodiscovery**
-- enable `squeezelite.service`, `minidsp.service` and
-  `minidsp-mqtt.service` systemd units
+- enable `squeezelite.service`, `minidsp.service`,
+  `minidsp-mqtt.service` and `minidsp-watchdog.timer` systemd units — the
+  watchdog probes minidspd's HTTP API every 60 s and after 2 consecutive
+  failures restarts `minidsp` + `minidsp-mqtt` (recovers from a known
+  minidsp-rs HID-loop wedge; it skips services you stopped on purpose;
+  diagnose with `journalctl -t minidsp-watchdog`)
 
 Total time on first run: ~3 minutes (squeezelite is built from source).
 
@@ -64,7 +68,7 @@ Total time on first run: ~3 minutes (squeezelite is built from source).
 | `DISK_SIZE` | `4` | rootfs GB |
 | `STORAGE` | `local-lvm` | rootfs storage |
 | `BRIDGE` | `vmbr0` | network bridge |
-| `PASSWORD` | `squeezelite` | container root password |
+| `PASSWORD` | *(random, printed once)* | container root password |
 | `PLAYER_NAME` | `squeezelite` | shown in LMS |
 | `LMS_IP` | *(empty)* | LMS server IP — empty = auto-discover |
 | `MQTT_HOST` | `192.168.1.3` | MQTT broker (HA Mosquitto add-on) |
@@ -92,11 +96,12 @@ Run from the Proxmox host (no need to enter the container):
 ./squeezelite-ctl.sh set curve=2                  # CURVE_K (1=linear, >1=bottom-heavy)
 ./squeezelite-ctl.sh set mqtt-host=192.168.1.3    # MQTT broker for HA bridge
 ./squeezelite-ctl.sh set mqtt-user=mqtt mqtt-pass=mqtt
-./squeezelite-ctl.sh set sources=Analog,Toslink,Spdif,Aesebu  # HA source-select options
+./squeezelite-ctl.sh set sources=Analog,Toslink,Usb   # HA source-select options (override auto-discovery)
 ./squeezelite-ctl.sh set name="Foo" lms=...       # multiple in one call
 ./squeezelite-ctl.sh edit                         # open /etc/default/squeezelite
 ./squeezelite-ctl.sh edit-mqtt                    # open /etc/default/minidsp-mqtt
 ./squeezelite-ctl.sh restart                      # restart squeezelite + minidsp + minidsp-mqtt
+./squeezelite-ctl.sh update                       # push this repo's minidsp-mqtt (+setup.sh) into the CT and restart the bridge
 ./squeezelite-ctl.sh logs -n 50                   # journalctl across all 3 units
 ./squeezelite-ctl.sh logs -f                      # follow live
 ./squeezelite-ctl.sh minidsp source toslink       # any minidsp CLI command (via /tmp/minidsp.sock)
@@ -128,9 +133,11 @@ HA device appears on first connect with these entities:
 |---|---|---|
 | Volume | `number` 0–100 | Same curve as `squeezelite-volume`. LMS / IR / HA agree exactly — see "Volume parity" below. |
 | Mute | `switch` | Independent of volume slider. |
-| Source | `select` | Options come from `SOURCES` env. The bridge ships a generic default of `Analog,Toslink,Spdif,Aesebu`; **DDRC-24 has `Usb` instead of `Spdif`** — set `./squeezelite-ctl.sh set sources=Analog,Toslink,Usb,Aesebu` to match. |
+| Source | `select` | Options are auto-discovered from minidspd's `product_name` (DDRC-24 → `Analog,Toslink,Usb`; other known models mapped in `PRODUCT_SOURCES`). Set `SOURCES` (`./squeezelite-ctl.sh set sources=...`) only to override the lookup — e.g. for an unmapped product. |
 | Preset | `select` | `Config 1`–`Config 4`. |
-| Bridge online | `binary_sensor` | LWT — `offline` if the bridge is down. |
+
+All entities share an availability topic (`status`, MQTT LWT): they show
+*unavailable* in HA whenever the bridge is down.
 
 Volume curve (matches `squeezelite-volume`):
 
@@ -167,13 +174,15 @@ directions:
 Re-measure the table per install if HA drifts from LMS UI:
 
 ```sh
+# on the Proxmox host — the volume file lives inside the CT, hence pct exec
 PLAYER=bc:24:11:3e:6a:17        # your squeezelite player MAC
 LMS=192.168.1.136:9000
+CTID=201
 for V in $(seq 0 100); do
   curl -s http://$LMS/jsonrpc.js \
     -d "{\"id\":1,\"method\":\"slim.request\",\"params\":[\"$PLAYER\",[\"mixer\",\"volume\",\"$V\"]]}" >/dev/null
   sleep 0.6
-  printf "%d:%s," $V "$(cat /tmp/sq-volume-req)"
+  printf "%d:%s," $V "$(pct exec $CTID -- cat /tmp/sq-volume-req)"
 done; echo
 ```
 
@@ -182,6 +191,17 @@ Paste the result into `./squeezelite-ctl.sh set calibration="…"`.
 Expected residual error: 0 across the table, with rare ±1 points where
 LMS's curve is locally flat (multiple LMS slider positions map to the
 same AUDG → ambiguous inverse).
+
+**Multiple containers:** `NODE_ID` (default: the container hostname) keys
+every MQTT topic, HA `unique_id`, and the MQTT client-id, so each container
+must have its own — two bridges sharing a NODE_ID would cross-drive each
+other's DSPs and kick each other off the broker. `CT_HOSTNAME` is unique per
+container, so the defaults are safe; override with
+`./squeezelite-ctl.sh set node-id=...` if needed. Renaming a NODE_ID leaves
+the old id's retained discovery/state topics on the broker (a dead duplicate
+device in HA) — clear them once with
+`mosquitto_pub -r -n -t 'homeassistant/<component>/<old_id>/<object>/config'`
+for each of the four entities, plus the old `minidsp/<old_id>/...` topics.
 
 MQTT topic layout (`minidsp/<NODE_ID>/...`):
 
@@ -195,6 +215,7 @@ master/source/set    command,         e.g. "Toslink"
 master/preset        state, retained, "Config 1".."Config 4"
 master/preset/set    command,         "Config 1".."Config 4" or "1".."4"
 status               LWT, retained,   "online" / "offline"
+ping                 bridge self-test (health loop), not retained
 homeassistant/.../config    HA discovery, retained
 ```
 

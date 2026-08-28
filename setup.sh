@@ -24,6 +24,14 @@ MQTT_PASS="${MQTT_PASS:-mqtt}"
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Escape a value for embedding inside a double-quoted string in the generated
+# config files (backslash, dquote, dollar, backtick) — the same rule
+# squeezelite-ctl.sh applies when editing the same files. Without this, a
+# PLAYER_NAME like `5" Speakers` writes an unterminated quote that makes
+# squeezelite-launch fail at source time, and $(...) would execute on every
+# service start.
+esc() { printf '%s' "$1" | sed 's/[\\$`"]/\\&/g'; }
+
 echo "==> Updating apt index..."
 apt-get update -q
 
@@ -158,19 +166,25 @@ echo "==> Writing /etc/default/squeezelite (key=value form) ..."
 # (squeezelite-ctl.sh) can edit individual keys without parsing one long
 # SL_OPTS string. The /usr/local/sbin/squeezelite-launch wrapper sources
 # this file and constructs the squeezelite argv from the variables.
+#
+# Create-only: a re-run must never clobber tuned settings (player name,
+# floor/curve, idle timeout) — that's what makes "safe to re-run" true.
+if [ -f /etc/default/squeezelite ]; then
+    echo "    /etc/default/squeezelite exists — leaving it untouched (delete it to regenerate)"
+else
 cat > /etc/default/squeezelite << EOF
 # squeezelite settings — edit then: systemctl restart squeezelite
 # (or use squeezelite-ctl.sh on the Proxmox host:
 #    ./squeezelite-ctl.sh set name="Living Room" lms=192.168.1.10)
 
 # Player name shown in LMS (spaces allowed)
-PLAYER_NAME="${PLAYER_NAME}"
+PLAYER_NAME="$(esc "$PLAYER_NAME")"
 
 # LMS server IP[:port]. Empty = auto-discover.
-LMS_IP="${LMS_IP}"
+LMS_IP="$(esc "$LMS_IP")"
 
 # ALSA output device for squeezelite -o
-ALSA_DEVICE="${ALSA_DEVICE}"
+ALSA_DEVICE="$(esc "$ALSA_DEVICE")"
 
 # ALSA params for squeezelite -a, format buffer:periods:format:mmap
 # 80:4::1 = 80 ms buffer, 4 periods, format=auto (device picks S32_LE on
@@ -198,6 +212,7 @@ IDLE_TIMEOUT="300"
 FLOOR_DB="-50"
 CURVE_K="2"
 EOF
+fi
 
 echo "==> Installing /usr/local/sbin/squeezelite-launch ..."
 # Tiny wrapper that reads /etc/default/squeezelite key=value pairs and execs
@@ -267,8 +282,11 @@ bind_unix_path = "/tmp/minidsp.sock"
 
 # TCP server on the legacy port used by the official MiniDSP plugin/mobile
 # apps. Kept so the "official" tooling still works alongside the bridge.
+# Bound to all interfaces: the apps connect over the LAN to <CT_IP>:5333 —
+# a loopback bind would make this feature unreachable from anywhere.
+# (Trusted-LAN appliance; delete this block if LAN exposure is unwanted.)
 [[tcp_server]]
-bind_address = "127.0.0.1:5333"
+bind_address = "0.0.0.0:5333"
 EOF
 
 echo "==> Installing minidsp.service systemd unit..."
@@ -298,6 +316,12 @@ echo "==> Writing /etc/default/minidsp-mqtt ..."
 # 0640 root:audio — readable by the bridge service (which runs as
 # User=squeezelite Group=audio), not world-readable. The container has no
 # 'squeezelite' group; the squeezelite user's primary group is audio.
+#
+# Create-only, like /etc/default/squeezelite above: a re-run must never wipe
+# the per-install CALIBRATION table, MQTT credentials, or LMS sync settings.
+if [ -f /etc/default/minidsp-mqtt ]; then
+    echo "    /etc/default/minidsp-mqtt exists — leaving it untouched (delete it to regenerate)"
+else
 install -m 0640 -g audio /dev/null /etc/default/minidsp-mqtt
 cat > /etc/default/minidsp-mqtt << EOF
 # minidsp-mqtt bridge settings.
@@ -309,15 +333,18 @@ MINIDSPD_URL="http://127.0.0.1:5380"
 DEVICE_INDEX="0"
 
 # MQTT broker — Home Assistant Mosquitto add-on by default
-MQTT_HOST="${MQTT_HOST}"
-MQTT_PORT="${MQTT_PORT}"
-MQTT_USER="${MQTT_USER}"
-MQTT_PASS="${MQTT_PASS}"
+MQTT_HOST="$(esc "$MQTT_HOST")"
+MQTT_PORT="$(esc "$MQTT_PORT")"
+MQTT_USER="$(esc "$MQTT_USER")"
+MQTT_PASS="$(esc "$MQTT_PASS")"
 
-# Topic / discovery layout
+# Topic / discovery layout. NODE_ID defaults to the container hostname so a
+# second container gets its own topics, HA unique_ids, and MQTT client-id —
+# two bridges sharing NODE_ID would cross-drive each other's DSPs and kick
+# each other off the broker (duplicate client-id).
 BASE_TOPIC="minidsp"
 DISCOVERY_PREFIX="homeassistant"
-NODE_ID="minidsp"
+NODE_ID="$(esc "${NODE_ID:-$(hostname)}")"
 
 # Source enum exposed in HA. Empty = auto-discover from minidspd's
 # product_name. Set explicitly only to override the lookup for a product
@@ -332,8 +359,8 @@ SOURCES=""
 #
 # Default below was measured on 2026-05 against this CT. Re-measure per
 # install if HA ever drifts from LMS UI:
-#   for V in $(seq 0 100); do
-#     curl -s http://<lms>:9000/jsonrpc.js \
+#   for V in \$(seq 0 100); do
+#     curl -s http://<lms>:9000/jsonrpc.js \\
 #       -d "{\"id\":1,\"method\":\"slim.request\",\"params\":[\"<MAC>\",[\"mixer\",\"volume\",\"\$V\"]]}" >/dev/null
 #     sleep 0.6
 #     echo -n "\$V:\$(cat /tmp/sq-volume-req),"
@@ -352,6 +379,7 @@ LMS_PLAYER_MAC=""
 
 LOG_LEVEL="INFO"
 EOF
+fi
 chmod 0640 /etc/default/minidsp-mqtt
 chgrp audio /etc/default/minidsp-mqtt
 
@@ -389,6 +417,11 @@ echo "==> Installing minidsp-watchdog (auto-recovers from minidspd HID stalls)..
 cat > /usr/local/sbin/minidsp-health-check << 'EOF'
 #!/bin/bash
 set -eu
+# Respect a deliberate stop (e.g. `systemctl stop minidsp` to debug the DSP
+# with the minidsp CLI in direct-USB mode): the watchdog's job is only the
+# "daemon running but HID loop wedged" case — never resurrect a service an
+# admin intentionally stopped.
+systemctl is-active --quiet minidsp.service || exit 0
 URL="http://127.0.0.1:5380/devices/0"
 STATE=/run/minidsp-watchdog.fail-count
 THRESHOLD=2

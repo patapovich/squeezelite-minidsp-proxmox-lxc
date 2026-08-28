@@ -11,11 +11,15 @@
 #   ./squeezelite-ctl.sh set device=hw:0,0            # change ALSA output
 #   ./squeezelite-ctl.sh set buffer=120:4::1          # change ALSA params (-a)
 #   ./squeezelite-ctl.sh set extra="-d output=info"   # extra squeezelite flags
+#   ./squeezelite-ctl.sh set idle=300                 # idle secs before Toslink failover (empty = never)
 #   ./squeezelite-ctl.sh set floor=-30                # volume-script floor
 #   ./squeezelite-ctl.sh set curve=2                  # volume-script curve exponent (1=linear, >1=bottom-heavy)
 #   ./squeezelite-ctl.sh set mqtt-host=192.168.1.3    # MQTT broker for HA bridge
-#   ./squeezelite-ctl.sh set mqtt-user=mqtt mqtt-pass=mqtt
-#   ./squeezelite-ctl.sh set sources=Analog,Toslink,Spdif,Aesebu  # HA select options
+#   ./squeezelite-ctl.sh set mqtt-port=1883 mqtt-user=mqtt mqtt-pass=mqtt
+#   ./squeezelite-ctl.sh set sources=Analog,Toslink,Usb   # HA select options (override auto-discovery)
+#   ./squeezelite-ctl.sh set node-id=livingroom       # MQTT topic/discovery id — NOTE: renaming leaves the
+#                                                     # old id's retained topics behind; clean them with e.g.
+#                                                     # mosquitto_pub -r -n -t 'homeassistant/number/<old>/master_volume/config' (etc.)
 #   ./squeezelite-ctl.sh set ha-floor=54              # legacy: linear-in-dB approximation (unused since CALIBRATION)
 #   ./squeezelite-ctl.sh set delay=0.03               # bridge command-coalesce window (s; smaller = snappier)
 #   ./squeezelite-ctl.sh set calibration="0:0,...100:100"   # LMS slider ↔ squeezelite-vol mapping
@@ -24,7 +28,9 @@
 #   ./squeezelite-ctl.sh set name="Foo" lms=...       # multiple in one call
 #   ./squeezelite-ctl.sh edit                         # open /etc/default/squeezelite
 #   ./squeezelite-ctl.sh edit-mqtt                    # open /etc/default/minidsp-mqtt
-#   ./squeezelite-ctl.sh restart                      # restart squeezelite + minidsp-mqtt
+#   ./squeezelite-ctl.sh restart                      # restart minidsp + minidsp-mqtt + squeezelite
+#   ./squeezelite-ctl.sh update                       # push this repo's minidsp-mqtt + setup.sh into the CT,
+#                                                     # restart the bridge (deploy a fix without recreating)
 #   ./squeezelite-ctl.sh logs [-f] [-n N]             # journalctl for all 3 units
 #   ./squeezelite-ctl.sh minidsp [args...]            # run minidsp inside the CT
 #
@@ -82,10 +88,12 @@ cmd_status() {
     done
     echo
     echo "=== $CONF_SQ ==="
-    pct exec "$CTID" -- cat "$CONF_SQ" 2>/dev/null
+    pct exec "$CTID" -- cat "$CONF_SQ" 2>/dev/null \
+        || echo "(missing — has setup.sh completed in this CT?)"
     echo
     echo "=== $CONF_MQ ==="
-    pct exec "$CTID" -- cat "$CONF_MQ" 2>/dev/null
+    pct exec "$CTID" -- cat "$CONF_MQ" 2>/dev/null \
+        || echo "(missing — has setup.sh completed in this CT?)"
     echo
     echo "=== minidsp (live state) ==="
     pct exec "$CTID" -- minidsp 2>&1 | head -3 || true
@@ -125,10 +133,14 @@ cmd_set() {
         local tmp="${tmp_for[$conf]}"
 
         # Escape for double-quoted string: backslash, dquote, dollar, backtick.
+        # The escaped value is passed to awk via the environment, NOT `-v`:
+        # awk -v re-interprets C-style backslash escapes and would undo the
+        # sed escaping (corrupting quotes, and letting a crafted value inject
+        # shell that runs when the conf is sourced). ENVIRON[] is verbatim.
         local esc; esc=$(printf '%s' "$value" | sed 's/[\\$`"]/\\&/g')
         if grep -q "^${var}=" "$tmp"; then
-            awk -v var="$var" -v val="$esc" '
-                $0 ~ "^"var"=" { print var "=\"" val "\""; next }
+            ESC_VAL="$esc" awk -v var="$var" '
+                $0 ~ "^"var"=" { print var "=\"" ENVIRON["ESC_VAL"] "\""; next }
                                 { print }
             ' "$tmp" > "${tmp}.new" && mv "${tmp}.new" "$tmp"
         else
@@ -161,7 +173,9 @@ cmd_set() {
 cmd_edit() {
     ensure_running
     pct exec "$CTID" -- "${EDITOR:-nano}" "$CONF_SQ"
-    pct exec "$CTID" -- systemctl restart squeezelite
+    # Both services source this file (FLOOR_DB/CURVE_K feed the HA volume
+    # curve too) — restarting only squeezelite would desync the two paths.
+    pct exec "$CTID" -- systemctl restart squeezelite minidsp-mqtt
 }
 
 cmd_edit_mqtt() {
@@ -178,6 +192,27 @@ cmd_restart() {
         pct exec "$CTID" -- systemctl is-active "$s" \
             | awk -v n="$s" '{printf "%-14s %s\n", n":", $0}'
     done
+}
+
+cmd_update() {
+    # Deploy this repo's current minidsp-mqtt (and setup.sh, for a later
+    # manual re-run) into an existing container — the supported way to ship
+    # a bridge fix without destroy-and-recreate.
+    ensure_running
+    local dir; dir="$(cd "$(dirname "$0")" && pwd)"
+    [ -r "$dir/minidsp-mqtt" ] || err "minidsp-mqtt not found next to this script"
+    echo "pushing minidsp-mqtt -> CT $CTID"
+    pct push "$CTID" "$dir/minidsp-mqtt" /usr/local/bin/minidsp-mqtt
+    pct exec "$CTID" -- chmod 755 /usr/local/bin/minidsp-mqtt
+    if [ -r "$dir/setup.sh" ]; then
+        echo "pushing setup.sh    -> CT $CTID"
+        pct push "$CTID" "$dir/setup.sh" /usr/local/sbin/squeezelite-setup.sh
+        pct exec "$CTID" -- chmod 755 /usr/local/sbin/squeezelite-setup.sh
+    fi
+    pct exec "$CTID" -- systemctl restart minidsp-mqtt
+    sleep 1
+    pct exec "$CTID" -- systemctl is-active minidsp-mqtt \
+        | awk '{printf "%-14s %s\n", "minidsp-mqtt:", $0}'
 }
 
 cmd_logs() {
@@ -202,6 +237,7 @@ case "$cmd" in
     edit)           cmd_edit       "$@" ;;
     edit-mqtt)      cmd_edit_mqtt  "$@" ;;
     restart)        cmd_restart    "$@" ;;
+    update)         cmd_update     "$@" ;;
     logs)           cmd_logs       "$@" ;;
     minidsp)        cmd_minidsp    "$@" ;;
     -h|--help|help) usage ;;

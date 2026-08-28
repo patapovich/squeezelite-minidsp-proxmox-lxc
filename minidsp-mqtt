@@ -7,7 +7,8 @@
 # and HA slider all agree on the same dB value:
 #
 #     gain_dB = FLOOR_DB * (1 - (vol/100)^CURVE_K)        for vol >= 1
-#     vol = 0 -> gain = -127 dB (hard mute)
+#     vol = 0 -> gain = FLOOR_DB (HA-driven floor; -127 hard mute is only
+#                the squeezelite pause sentinel, filtered via MUTE_SENTINEL_DB)
 #
 # Configuration via environment (see /etc/default/minidsp-mqtt and
 # /etc/default/squeezelite):
@@ -258,6 +259,7 @@ def read_lms_vol():
 def t_state(field):  return f"{BASE_TOPIC}/{NODE_ID}/master/{field}"
 def t_set(field):    return f"{BASE_TOPIC}/{NODE_ID}/master/{field}/set"
 def t_status():      return f"{BASE_TOPIC}/{NODE_ID}/status"
+def t_ping():        return f"{BASE_TOPIC}/{NODE_ID}/ping"
 def disco_topic(component, obj):
     return f"{DISCOVERY_PREFIX}/{component}/{NODE_ID}/{obj}/config"
 
@@ -394,10 +396,13 @@ class Throttle:
         self.dispatch = None      # latest dispatch callable
         self.last_fire = 0.0      # monotonic time of last dispatch
         self.scheduled = False    # a trailing fire is armed
+        self._seq = 0             # bumped per submit; stamps each fire
+        self._lock = asyncio.Lock()  # serialises dispatches in fire order
 
     def submit(self, target, dispatch):
         self.target = target
         self.dispatch = dispatch
+        self._seq += 1
         if self.scheduled:
             return                # trailing fire already armed; it'll use target
         elapsed = time.monotonic() - self.last_fire
@@ -410,14 +415,22 @@ class Throttle:
     def _fire(self):
         self.scheduled = False
         self.last_fire = time.monotonic()
-        target, dispatch = self.target, self.dispatch
-        self.loop.create_task(self._run(dispatch, target))
+        target, dispatch, seq = self.target, self.dispatch, self._seq
+        self.loop.create_task(self._run(dispatch, target, seq))
 
-    async def _run(self, dispatch, target):
-        try:
-            await dispatch(target)
-        except Exception as e:
-            log.error("throttled dispatch failed: %s", e)
+    async def _run(self, dispatch, target, seq):
+        # The lock keeps dispatches in fire order: without it, an older POST
+        # stuck in post_config's retry backoff could land AFTER a newer one
+        # and leave the device at a stale volume. The seq check drops a fire
+        # that was superseded while it queued behind the lock — the newer
+        # fire delivers the same-or-later target anyway.
+        async with self._lock:
+            if seq != self._seq:
+                return
+            try:
+                await dispatch(target)
+            except Exception as e:
+                log.error("throttled dispatch failed: %s", e)
 
 
 # ── bridge ───────────────────────────────────────────────────────────────
@@ -427,8 +440,17 @@ class Bridge:
         self.http = httpx.AsyncClient(base_url=MINIDSPD_URL, timeout=5.0)
         self._coalescers = {}     # field -> Coalescer
 
-        self.mqtt = mqtt.Client(client_id=f"minidsp-mqtt-{NODE_ID}",
-                                clean_session=True)
+        # paho-mqtt 2.x requires an explicit callback API version (1.x has no
+        # such argument; 2.1's implicit default is VERSION1 but deprecated and
+        # slated for removal). VERSION1 keeps our v1-style callback signatures
+        # valid on both major versions.
+        if hasattr(mqtt, "CallbackAPIVersion"):
+            self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1,
+                                    client_id=f"minidsp-mqtt-{NODE_ID}",
+                                    clean_session=True)
+        else:
+            self.mqtt = mqtt.Client(client_id=f"minidsp-mqtt-{NODE_ID}",
+                                    clean_session=True)
         if MQTT_USER:
             self.mqtt.username_pw_set(MQTT_USER, MQTT_PASS)
         self.mqtt.will_set(t_status(), "offline", qos=1, retain=True)
@@ -463,6 +485,12 @@ class Bridge:
         # remote ramp) instead of the trailing-only Coalescer used by the
         # discrete mute/source/preset fields.
         self._volume_throttle = Throttle(self.loop, COALESCE_DELAY)
+
+        # Set in run() before MQTT connects; _on_mqtt_connect republishes
+        # discovery + state from these on every (re)connect.
+        self._devinfo = None
+        self._sources = None
+        self._health_task = None
 
     def _coalescer(self, field):
         if field not in self._coalescers:
@@ -530,6 +558,11 @@ class Bridge:
                 last_exc = httpx.HTTPStatusError(
                     f"server returned {r.status_code}",
                     request=r.request, response=r)
+            except httpx.HTTPStatusError:
+                # Only the 4xx raise_for_status() above raises this inside
+                # the try; without this clause the generic HTTPError handler
+                # below would retry the non-retryable case.
+                raise
             except httpx.HTTPError as e:
                 last_exc = e
             if i < attempts - 1:
@@ -567,9 +600,15 @@ class Bridge:
                       gain)
             return
         sq = read_lms_vol()
-        if sq is None:
+        # The file only changes when squeezelite-volume runs, i.e. on
+        # LMS-driven changes. A gain change from any other path (IR remote,
+        # `minidsp gain` CLI, mobile app) leaves the file stale — so trust it
+        # only when it actually reproduces the reported gain. 1.5 dB covers
+        # the device's gain quantisation and a single IR step, while a real
+        # divergence (held ramp, CLI set) falls through to the inverse curve.
+        if sq is None or abs(vol_to_db(sq) - gain) > 1.5:
             sq = db_to_vol(gain)
-            log.debug("LMS_VOL_FILE unavailable; using inverse curve -> sq=%d", sq)
+            log.debug("LMS_VOL_FILE stale/unavailable; inverse curve -> sq=%d", sq)
         lms_vol = sq_to_lms(sq)
         self.publish(t_state("volume"), str(lms_vol))
 
@@ -598,10 +637,22 @@ class Bridge:
         for component, obj, payload in discovery_payloads(devinfo, sources):
             self.publish(disco_topic(component, obj), json.dumps(payload))
 
+    async def _republish_state(self):
+        try:
+            self.publish_discovery(self._devinfo, self._sources)
+            self.publish_master(await self.fetch_master())
+        except Exception as e:
+            log.warning("state republish after (re)connect failed: %s: %s",
+                        type(e).__name__, e or "(no message)")
+
     # ── MQTT callbacks (paho thread) ─────────────────────────────────────
     def _subscribe_command_topics(self):
         for f in ("volume", "mute", "source", "preset"):
             self.mqtt.subscribe(t_set(f), qos=1)
+        # Own ping topic: the health loop publishes here each pass, and the
+        # message coming back proves the subscribe path works end-to-end
+        # (and refreshes last_inbound_ms through _on_mqtt_message).
+        self.mqtt.subscribe(t_ping(), qos=1)
 
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         if rc != 0:
@@ -610,6 +661,14 @@ class Bridge:
         log.info("MQTT connected to %s:%s", MQTT_HOST, MQTT_PORT)
         self.mqtt.publish(t_status(), "online", qos=1, retain=True)
         self._subscribe_command_topics()
+        # Re-assert retained discovery + state on every (re)connect: if the
+        # broker restarted without persistence, every retained topic (HA
+        # discovery configs included) is gone and nothing else would restore
+        # them — HA would drop the device on its next restart. Retained
+        # duplicates are idempotent for HA, so doing this every time is safe.
+        if self._devinfo is not None:
+            self.loop.call_soon_threadsafe(
+                lambda: self.loop.create_task(self._republish_state()))
 
     def _on_mqtt_disconnect(self, client, userdata, rc):
         # rc==0 → graceful (our own disconnect on shutdown). Otherwise
@@ -651,6 +710,7 @@ class Bridge:
             # For HA-driven volume changes: echo the user's exact integer
             # to the state topic and mark the upcoming WS feedback as "ours"
             # so it doesn't trigger a stale LMS_VOL_FILE read.
+            target_db = None
             if field == "volume":
                 p = payload.strip()
                 now = time.monotonic()
@@ -666,10 +726,16 @@ class Bridge:
                 self.last_vol_payload_ts = now
                 target_db = patch.get("master_status", {}).get("volume")
                 if target_db is not None:
-                    self.last_written_gain = float(target_db)
-                    self.last_written_ts   = now
                     self.publish(t_state("volume"), p)
             await self.post_config(patch)
+            # Anchor the WS-echo suppression window at POST *completion*, not
+            # command receipt: post_config can retry for ~15 s when minidspd's
+            # HID loop stalls, and the echo always arrives after the POST —
+            # anchoring earlier let slow POSTs outlive the 3 s window and a
+            # stale LMS_VOL_FILE read clobber the echoed state.
+            if target_db is not None:
+                self.last_written_gain = float(target_db)
+                self.last_written_ts   = time.monotonic()
             # Best-effort, debounced: tell LMS to update its own slider so it
             # doesn't later re-assert a stale position. The push is coalesced
             # (LMS_PUSH_DELAY of quiet) so a ramp fires one JSON-RPC, not one
@@ -740,6 +806,15 @@ class Bridge:
         await asyncio.sleep(INTERVAL_S)
         while True:
             try:
+                # Self-ping: command topics only see traffic when a human
+                # acts, so without this a quiet night is indistinguishable
+                # from dropped subscriptions and the silence branch would
+                # bounce a perfectly healthy connection. The ping loops back
+                # through our own subscription (see _subscribe_command_topics)
+                # and refreshes last_inbound_ms before the *next* pass judges
+                # silence.
+                self.publish(t_ping(), "ping", retain=False)
+
                 connected = self.mqtt.is_connected()
                 thread = getattr(self.mqtt, "_thread", None)
                 thread_alive = thread is not None and thread.is_alive()
@@ -752,11 +827,16 @@ class Bridge:
                         "MQTT unhealthy (connected=%s thread_alive=%s); "
                         "bouncing client", connected, thread_alive)
                     await self.loop.run_in_executor(None, self._mqtt_bounce)
+                    # Restart the silence clock: a bounce is inbound-quiet by
+                    # definition, and without this reset the silence branch
+                    # would re-bounce on every pass until a command arrives.
+                    self.last_inbound_ms = int(time.monotonic() * 1000)
                 elif silence_ms > SILENCE_LIMIT_MS:
                     log.warning(
                         "MQTT silent for %ds (no inbound); resubscribing + "
                         "bouncing as a precaution", silence_ms // 1000)
                     await self.loop.run_in_executor(None, self._mqtt_bounce)
+                    self.last_inbound_ms = int(time.monotonic() * 1000)
                 else:
                     log.debug("MQTT health OK (silence=%ds); re-subscribing",
                               silence_ms // 1000)
@@ -819,23 +899,42 @@ class Bridge:
         log.info("device: %s", devinfo)
         sources = discover_sources(devinfo)
         log.info("HA source select options: %s", sources)
+        self._devinfo, self._sources = devinfo, sources
 
+        # Discovery + initial state are published by _on_mqtt_connect (via
+        # _republish_state) once the connection is actually up — and again on
+        # every reconnect, which also heals a broker that lost its retained
+        # state.
         self.mqtt.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
         self.mqtt.loop_start()
-        await asyncio.sleep(1)  # let MQTT settle so retained discovery arrives
 
-        self.publish_discovery(devinfo, sources)
-
-        master = await self.fetch_master()
-        self.publish_master(master)
-
-        # Run the MQTT health watchdog alongside the WS reader.
-        asyncio.create_task(self.mqtt_health_loop())
+        # Run the MQTT health watchdog alongside the WS reader. Keep the
+        # handle so close() can cancel it — a bare create_task would leak the
+        # task at shutdown (and its _mqtt_bounce could race close()).
+        self._health_task = asyncio.create_task(self.mqtt_health_loop())
         await self.ws_loop()
 
     async def close(self):
+        if self._health_task is not None:
+            self._health_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._health_task
         with suppress(Exception):
-            self.mqtt.publish(t_status(), "offline", qos=1, retain=True)
+            # Wait for the offline publish to actually flush: loop_stop()
+            # halts the network thread, and a clean disconnect() suppresses
+            # the LWT — without the wait, retained "online" would outlive the
+            # process and HA would show the bridge available forever.
+            info = self.mqtt.publish(t_status(), "offline", qos=1, retain=True)
+
+            def _flush():
+                try:
+                    info.wait_for_publish(2)
+                except TypeError:   # paho <1.6 has no timeout parameter
+                    info.wait_for_publish()
+            # Outer bound covers the no-timeout fallback; the surrounding
+            # suppress() absorbs the TimeoutError.
+            await asyncio.wait_for(
+                self.loop.run_in_executor(None, _flush), 3)
         with suppress(Exception):
             self.mqtt.loop_stop()
             self.mqtt.disconnect()
@@ -865,6 +964,11 @@ def main():
             with suppress(asyncio.CancelledError):
                 await p
         await bridge.close()
+        # Propagate a crash out of bridge.run(): without this the exception
+        # is silently discarded, the process exits 0, and systemd's
+        # Restart=on-failure never restarts a dead bridge.
+        if task in done and not task.cancelled() and task.exception():
+            raise task.exception()
 
     try:
         loop.run_until_complete(runner())

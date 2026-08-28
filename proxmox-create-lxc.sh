@@ -29,7 +29,7 @@
 #   DISK_SIZE    rootfs GB                          (default: 4)
 #   STORAGE      rootfs storage                     (default: local-lvm)
 #   BRIDGE       network bridge                     (default: vmbr0)
-#   PASSWORD     root password                      (default: squeezelite)
+#   PASSWORD     root password                      (default: random, printed once)
 #   PLAYER_NAME  name shown in LMS                  (default: squeezelite)
 #   LMS_IP       LMS server IP, empty = discover    (default: empty)
 #   MQTT_HOST    MQTT broker (HA Mosquitto add-on)  (default: 192.168.1.3)
@@ -47,7 +47,18 @@ DISK_SIZE="${DISK_SIZE:-4}"
 STORAGE="${STORAGE:-local-lvm}"
 BRIDGE="${BRIDGE:-vmbr0}"
 TPL_STORAGE="${TPL_STORAGE:-local}"
-PASSWORD="${PASSWORD:-squeezelite}"
+
+# Container root password. No fixed default: this repo is public, the CT is
+# LAN-attached and privileged, and Debian templates commonly permit root
+# password SSH — a well-known default would hand out root to anything on the
+# LAN. Generate a random one unless the caller sets PASSWORD explicitly; it
+# is printed once in the summary (console access via `pct enter` never needs
+# it).
+GENERATED_PASSWORD=""
+if [ -z "${PASSWORD:-}" ]; then
+    PASSWORD="$(openssl rand -base64 18)"
+    GENERATED_PASSWORD=1
+fi
 
 DEBIAN_RELEASE="${DEBIAN_RELEASE:-bookworm}"
 case "$DEBIAN_RELEASE" in
@@ -78,7 +89,10 @@ if [ -n "$MINIDSP_LINE" ]; then
     echo "==> MiniDSP detected on host: $MINIDSP_LINE"
 else
     echo "WARNING: no MiniDSP currently visible on host (lsusb shows nothing matching 2752:/miniDSP)."
-    echo "         The container will still install, but minidsp will fail until you plug it in."
+    echo "         The container will still install, but audio needs a container"
+    echo "         restart after plugging in: the /dev/snd bind mount is evaluated"
+    echo "         only at container start (and /dev/snd may not exist on the host"
+    echo "         until a USB sound device appears), so run:  pct stop ${CTID} && pct start ${CTID}"
 fi
 
 # Confirm at least one USB audio card is exposed by the host kernel.
@@ -94,16 +108,25 @@ echo
 echo "==> Refreshing pveam template index..."
 pveam update >/dev/null 2>&1 || true
 
-TPL_GLOB="/var/lib/vz/template/cache/${TEMPLATE}_*.tar.zst"
-if ! ls $TPL_GLOB >/dev/null 2>&1; then
+# Resolve the template through pveam (not a hardcoded /var/lib/vz path, which
+# only exists for the 'local' storage — any other TPL_STORAGE would
+# re-download and then fail to find the file). `pveam list` prints volids
+# like local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst; take the last
+# match so multiple cached versions resolve to the newest.
+resolve_template() {
+    pveam list "$TPL_STORAGE" 2>/dev/null \
+        | awk -v t="${TEMPLATE}" '$1 ~ t {v=$1} END {if (v) print v}'
+}
+TPL_REF=$(resolve_template)
+if [ -z "$TPL_REF" ]; then
     echo "==> Downloading ${TEMPLATE} template..."
     TPL_NAME=$(pveam available --section system 2>/dev/null \
                 | awk -v t="${TEMPLATE}" '$2 ~ t {print $2; exit}')
     [ -n "$TPL_NAME" ] || { echo "ERROR: ${TEMPLATE} not in pveam available list"; exit 1; }
     pveam download "$TPL_STORAGE" "$TPL_NAME"
+    TPL_REF=$(resolve_template)
+    [ -n "$TPL_REF" ] || { echo "ERROR: template not visible in storage '${TPL_STORAGE}' after download"; exit 1; }
 fi
-TPL_FILE=$(ls -t $TPL_GLOB | head -1)
-TPL_REF="${TPL_STORAGE}:vztmpl/$(basename "$TPL_FILE")"
 echo "==> Using template: $TPL_REF"
 echo
 
@@ -154,16 +177,38 @@ EOF
 echo "==> Starting container..."
 pct start "$CTID"
 
-echo "==> Waiting for container network..."
-for i in $(seq 1 30); do
-    pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1 && break
-    sleep 1
-done
-
+# Push before the network wait: pct push needs no CT network, and if the
+# wait fails the recovery command below then refers to a script that is
+# already inside the container.
 echo "==> Pushing setup.sh + minidsp-mqtt into container..."
 pct push "$CTID" "$SETUP_SCRIPT"  /usr/local/sbin/squeezelite-setup.sh
 pct push "$CTID" "$BRIDGE_SCRIPT" /usr/local/bin/minidsp-mqtt
 pct exec "$CTID" -- chmod 755 /usr/local/sbin/squeezelite-setup.sh /usr/local/bin/minidsp-mqtt
+
+echo "==> Waiting for container network..."
+NET_OK=""
+for i in $(seq 1 30); do
+    if pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1; then
+        NET_OK=1
+        break
+    fi
+    sleep 1
+done
+if [ -z "$NET_OK" ]; then
+    cat >&2 <<ERR
+
+ERROR: container has no network/DNS after 30s (bridge ${BRIDGE}, DHCP).
+       The container is created and running but NOT provisioned. Fix the
+       networking, then finish setup with your tunables preserved:
+
+       pct exec ${CTID} -- env \\
+           PLAYER_NAME="${PLAYER_NAME}" LMS_IP="${LMS_IP}" \\
+           MQTT_HOST="${MQTT_HOST}" MQTT_PORT="${MQTT_PORT}" \\
+           MQTT_USER="${MQTT_USER}" MQTT_PASS="${MQTT_PASS}" \\
+           /usr/local/sbin/squeezelite-setup.sh
+ERR
+    exit 1
+fi
 
 echo "==> Running setup.sh inside container (this builds squeezelite — ~3 min)..."
 pct exec "$CTID" -- env \
@@ -184,6 +229,11 @@ cat <<INFO
 ==> LXC ${CTID} (${CT_HOSTNAME}) ready.
     IP:           ${CT_IP:-<DHCP pending>}
     Login:        pct enter ${CTID}     (or ssh root@${CT_IP:-<ip>})
+INFO
+if [ -n "$GENERATED_PASSWORD" ]; then
+    echo "    Root pass:    ${PASSWORD}   (generated — save it now; shown only once)"
+fi
+cat <<INFO
     Player:       ${PLAYER_NAME}
     LMS:          ${LMS_IP:-auto-discover}
     MQTT:         ${MQTT_USER}@${MQTT_HOST}:${MQTT_PORT}
