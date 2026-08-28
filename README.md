@@ -87,6 +87,7 @@ Run from the Proxmox host (no need to enter the container):
 ./squeezelite-ctl.sh set device=hw:CARD=DDRC24,DEV=0
 ./squeezelite-ctl.sh set buffer=80:4::1           # squeezelite -a (buffer:periods:format:mmap)
 ./squeezelite-ctl.sh set extra="-d output=info"   # any extra squeezelite flags
+./squeezelite-ctl.sh set idle=300                 # idle seconds before Toslink failover (empty = never)
 ./squeezelite-ctl.sh set floor=-72                # FLOOR_DB (used by both LMS + HA paths)
 ./squeezelite-ctl.sh set curve=2                  # CURVE_K (1=linear, >1=bottom-heavy)
 ./squeezelite-ctl.sh set mqtt-host=192.168.1.3    # MQTT broker for HA bridge
@@ -108,6 +109,13 @@ Each `set` writes the requested var into the container's
 and `curve` live in `/etc/default/squeezelite` and feed both the LMS path
 (via squeezelite-volume) and the HA path (via minidsp-mqtt), so the slider
 behaves identically in both UIs.
+
+`idle` sets `IDLE_TIMEOUT` (squeezelite `-C`): after that many seconds with
+no playback, squeezelite closes the ALSA device and the `-S` source script
+switches the MiniDSP input to Toslink (vinyl). Starting playback in LMS
+switches back to Usb and reopens the device automatically. The player stays
+visible in LMS the whole time. Default `300`; empty = never release the
+device.
 
 ## Home Assistant integration
 

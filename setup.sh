@@ -181,6 +181,12 @@ ALSA_PARAMS="80:4::1"
 # Anything else to append (e.g. -d output=info, -c flac,pcm)
 EXTRA_OPTS=""
 
+# Idle timeout (seconds) for squeezelite -C: after this long with no
+# playback the ALSA device is closed and the -S source script switches the
+# MiniDSP input to Toslink (vinyl). Playback resuming switches back to Usb
+# and reopens the device. Empty = never release the device.
+IDLE_TIMEOUT="300"
+
 # squeezelite-volume / minidsp-mqtt volume curve.
 #   gain_dB = FLOOR_DB * (1 - (vol/100)^CURVE_K)
 # Both the LMS path (squeezelite-volume) and the HA path (minidsp-mqtt) read
@@ -215,6 +221,7 @@ args=(
 )
 [ -n "${ALSA_PARAMS:-}" ] && args+=(-a "${ALSA_PARAMS}")
 [ -n "${LMS_IP:-}"      ] && args+=(-s "${LMS_IP}")
+[ -n "${IDLE_TIMEOUT:-}" ] && args+=(-C "${IDLE_TIMEOUT}")
 # EXTRA_OPTS is intentionally word-split (use it for multiple flags)
 [ -n "${EXTRA_OPTS:-}"  ] && args+=(${EXTRA_OPTS})
 exec /usr/local/bin/squeezelite "${args[@]}"

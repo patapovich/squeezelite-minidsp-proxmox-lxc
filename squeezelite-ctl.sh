@@ -53,6 +53,7 @@ key_meta() {
         device)    echo "ALSA_DEVICE	$CONF_SQ	squeezelite" ;;
         buffer)    echo "ALSA_PARAMS	$CONF_SQ	squeezelite" ;;
         extra)     echo "EXTRA_OPTS	$CONF_SQ	squeezelite" ;;
+        idle)      echo "IDLE_TIMEOUT	$CONF_SQ	squeezelite" ;;
         floor)     echo "FLOOR_DB	$CONF_SQ	squeezelite minidsp-mqtt" ;;
         curve)     echo "CURVE_K	$CONF_SQ	squeezelite minidsp-mqtt" ;;
         mqtt-host) echo "MQTT_HOST	$CONF_MQ	minidsp-mqtt" ;;
@@ -66,7 +67,7 @@ key_meta() {
         calibration)   echo "CALIBRATION	$CONF_MQ	minidsp-mqtt" ;;
         lms-host)      echo "LMS_HOST	$CONF_MQ	minidsp-mqtt" ;;
         lms-player)    echo "LMS_PLAYER_MAC	$CONF_MQ	minidsp-mqtt" ;;
-        *) err "unknown key '$1' (allowed: name, lms, device, buffer, extra, floor, curve, mqtt-host, mqtt-port, mqtt-user, mqtt-pass, sources, node-id, ha-floor, delay, calibration, lms-host, lms-player)" ;;
+        *) err "unknown key '$1' (allowed: name, lms, device, buffer, extra, idle, floor, curve, mqtt-host, mqtt-port, mqtt-user, mqtt-pass, sources, node-id, ha-floor, delay, calibration, lms-host, lms-player)" ;;
     esac
 }
 
